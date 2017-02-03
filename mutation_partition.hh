@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include <iostream>
+#include <iosfwd>
 #include <map>
 #include <boost/intrusive/set.hpp>
 #include <boost/range/iterator_range.hpp>
@@ -41,6 +41,7 @@
 #include "hashing_partition_visitor.hh"
 #include "range_tombstone_list.hh"
 #include "clustering_key_filter.hh"
+#include "intrusive_set_external_comparator.hh"
 
 //
 // Container for cells of a row. Cells are identified by column_id.
@@ -193,7 +194,17 @@ public:
     // Calls Func(column_id, atomic_cell_or_collection&) for each cell in this row.
     // noexcept if Func doesn't throw.
     template<typename Func>
-    void for_each_cell(Func&&);
+    void for_each_cell(Func&& func) {
+        if (_type == storage_type::vector) {
+            for (auto i : bitsets::for_each_set(_storage.vector.present)) {
+                func(i, _storage.vector.v[i]);
+            }
+        } else {
+            for (auto& cell : _storage.set) {
+                func(cell.id(), cell.cell());
+            }
+        }
+    }
 
     template<typename Func>
     void for_each_cell(Func&& func) const {
@@ -266,7 +277,7 @@ public:
 
     bool equal(column_kind kind, const schema& this_schema, const row& other, const schema& other_schema) const;
 
-    size_t memory_usage() const;
+    size_t external_memory_usage() const;
 
     friend std::ostream& operator<<(std::ostream& os, const row& r);
 };
@@ -438,15 +449,15 @@ public:
 };
 
 class rows_entry {
-    boost::intrusive::set_member_hook<> _link;
+    intrusive_set_external_comparator_member_hook _link;
     clustering_key _key;
     deletable_row _row;
     friend class mutation_partition;
 public:
-    rows_entry(clustering_key&& key)
+    explicit rows_entry(clustering_key&& key)
         : _key(std::move(key))
     { }
-    rows_entry(const clustering_key& key)
+    explicit rows_entry(const clustering_key& key)
         : _key(key)
     { }
     rows_entry(const clustering_key& key, deletable_row&& row)
@@ -534,10 +545,7 @@ class serializer;
 
 class mutation_partition final {
 public:
-    // FIXME: using boost::intrusive because gcc's std::set<> does not support heterogeneous lookup yet
-    using rows_type = boost::intrusive::set<rows_entry,
-        boost::intrusive::member_hook<rows_entry, boost::intrusive::set_member_hook<>, &rows_entry::_link>,
-        boost::intrusive::compare<rows_entry::compare>>;
+    using rows_type = intrusive_set_external_comparator<rows_entry, &rows_entry::_link>;
     friend class rows_entry;
     friend class size_calculator;
 private:
@@ -555,11 +563,11 @@ private:
 public:
     struct copy_comparators_only {};
     mutation_partition(schema_ptr s)
-        : _rows(rows_entry::compare(*s))
+        : _rows()
         , _row_tombstones(*s)
     { }
     mutation_partition(mutation_partition& other, copy_comparators_only)
-        : _rows(other._rows.key_comp())
+        : _rows()
         , _row_tombstones(other._row_tombstones, range_tombstone_list::copy_comparator_only())
     { }
     mutation_partition(mutation_partition&&) = default;
@@ -673,8 +681,8 @@ public:
     // Returns true if there is no live data or tombstones.
     bool empty() const;
 public:
-    deletable_row& clustered_row(const clustering_key& key);
-    deletable_row& clustered_row(clustering_key&& key);
+    deletable_row& clustered_row(const schema& s, const clustering_key& key);
+    deletable_row& clustered_row(const schema& s, clustering_key&& key);
     deletable_row& clustered_row(const schema& s, const clustering_key_view& key);
 public:
     tombstone partition_tombstone() const { return _tombstone; }
@@ -685,7 +693,7 @@ public:
     const range_tombstone_list& row_tombstones() const { return _row_tombstones; }
     rows_type& clustered_rows() { return _rows; }
     range_tombstone_list& row_tombstones() { return _row_tombstones; }
-    const row* find_row(const clustering_key& key) const;
+    const row* find_row(const schema& s, const clustering_key& key) const;
     tombstone range_tombstone_for_row(const schema& schema, const clustering_key& key) const;
     tombstone tombstone_for_row(const schema& schema, const clustering_key& key) const;
     tombstone tombstone_for_row(const schema& schema, const rows_entry& e) const;

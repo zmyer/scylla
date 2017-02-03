@@ -38,7 +38,7 @@
 #include "utils/UUID.hh"
 #include "database.hh"
 #include "net/byteorder.hh"
-#include <seastar/core/scollectd.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/net/byteorder.hh>
 #include <seastar/util/lazy.hh>
 
@@ -274,35 +274,28 @@ cql_server::cql_server(distributed<service::storage_proxy>& proxy, distributed<c
     , _query_processor(qp)
     , _max_request_size(memory::stats().total_memory() / 10)
     , _memory_available(_max_request_size)
-    , _collectd_registrations(std::make_unique<scollectd::registrations>(setup_collectd()))
     , _lb(lb)
 {
-}
+    namespace sm = seastar::metrics;
 
-scollectd::registrations
-cql_server::setup_collectd() {
-    return {
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("transport", scollectd::per_cpu_plugin_instance,
-                    "connections", "cql-connections"),
-            scollectd::make_typed(scollectd::data_type::DERIVE, _connects)),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("transport", scollectd::per_cpu_plugin_instance,
-                    "current_connections", "current"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, _connections)),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("transport", scollectd::per_cpu_plugin_instance,
-                    "total_requests", "requests_served"),
-            scollectd::make_typed(scollectd::data_type::DERIVE, _requests_served)),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("transport", scollectd::per_cpu_plugin_instance,
-                    "queue_length", "requests_serving"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, _requests_serving)),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("transport", scollectd::per_cpu_plugin_instance,
-                    "queue_length", "requests_blocked_memory"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return _memory_available.waiters(); })),
-    };
+    _metrics.add_group("transport", {
+        sm::make_derive("cql-connections", _connects,
+                        sm::description("Counts a number of client connections.")),
+
+        sm::make_gauge("current_connections", _connections,
+                        sm::description("Holds a current number of client connections.")),
+
+        sm::make_derive("requests_served", _requests_served,
+                        sm::description("Counts a number of served requests.")),
+
+        sm::make_gauge("requests_serving", _requests_serving,
+                        sm::description("Holds a number of requests that are being processed right now.")),
+
+        sm::make_gauge("requests_blocked_memory", [this] { return _memory_available.waiters(); },
+                        sm::description(
+                            seastar::format("Holds a number of requests that are blocked due to reaching the memory quota limit ({}B). "
+                                            "Non-zero value indicates that our bottleneck is memory and more specifically - the memory quota allocated for the \"CQL transport\" component.", _max_request_size))),
+    });
 }
 
 future<> cql_server::stop() {
@@ -868,7 +861,7 @@ future<response_type> cql_server::connection::process_execute(uint16_t stream, b
     auto q_state = std::make_unique<cql_query_state>(client_state);
     auto& query_state = q_state->query_state;
     if (_version == 1) {
-        std::vector<bytes_view_opt> values;
+        std::vector<cql3::raw_value_view> values;
         read_value_view_list(buf, values);
         auto consistency = read_consistency(buf);
         q_state->options = std::make_unique<cql3::query_options>(consistency, std::experimental::nullopt, values, false,
@@ -914,7 +907,7 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
     const unsigned n = read_short(buf);
 
     std::vector<shared_ptr<cql3::statements::modification_statement>> modifications;
-    std::vector<std::vector<bytes_view_opt>> values;
+    std::vector<std::vector<cql3::raw_value_view>> values;
 
     modifications.reserve(n);
     values.reserve(n);
@@ -955,7 +948,7 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
 
         modifications.emplace_back(std::move(modif_statement_ptr));
 
-        std::vector<bytes_view_opt> tmp;
+        std::vector<cql3::raw_value_view> tmp;
         read_value_view_list(buf, tmp);
 
         auto stmt = ps->statement;
@@ -976,7 +969,7 @@ cql_server::connection::process_batch(uint16_t stream, bytes_view buf, service::
     tracing::set_optional_serial_consistency_level(client_state.get_trace_state(), options.get_serial_consistency());
     tracing::trace(client_state.get_trace_state(), "Creating a batch statement");
 
-    auto batch = ::make_shared<cql3::statements::batch_statement>(-1, cql3::statements::batch_statement::type(type), std::move(modifications), cql3::attributes::none());
+    auto batch = ::make_shared<cql3::statements::batch_statement>(-1, cql3::statements::batch_statement::type(type), std::move(modifications), cql3::attributes::none(), _server._query_processor.local().get_cql_stats());
     return _server._query_processor.local().process_batch(batch, query_state, options).then([this, stream, batch] (auto msg) {
         return this->make_result(stream, msg);
     }).then([&query_state, q_state = std::move(q_state), this] (auto&& response) {
@@ -1262,6 +1255,17 @@ uint16_t cql_server::connection::read_short(bytes_view& buf)
     return n;
 }
 
+bytes_opt cql_server::connection::read_bytes(bytes_view& buf) {
+    auto len = read_int(buf);
+    if (len < 0) {
+        return {};
+    }
+    check_room(buf, len);
+    bytes b(reinterpret_cast<const int8_t*>(buf.begin()), len);
+    buf.remove_prefix(len);
+    return {std::move(b)};
+}
+
 bytes cql_server::connection::read_short_bytes(bytes_view& buf)
 {
     auto n = read_short(buf);
@@ -1352,14 +1356,14 @@ std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_
 {
     auto consistency = read_consistency(buf);
     if (version == 1) {
-        return std::make_unique<cql3::query_options>(consistency, std::experimental::nullopt, std::vector<bytes_view_opt>{},
+        return std::make_unique<cql3::query_options>(consistency, std::experimental::nullopt, std::vector<cql3::raw_value_view>{},
             false, cql3::query_options::specific_options::DEFAULT, _cql_serialization_format);
     }
 
     assert(version >= 2);
 
     auto flags = enum_set<options_flag_enum>::from_mask(read_byte(buf));
-    std::vector<bytes_view_opt> values;
+    std::vector<cql3::raw_value_view> values;
     std::vector<sstring_view> names;
 
     if (flags.contains<options_flag::VALUES>()) {
@@ -1379,7 +1383,7 @@ std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_
         ::shared_ptr<service::pager::paging_state> paging_state;
         int32_t page_size = flags.contains<options_flag::PAGE_SIZE>() ? read_int(buf) : -1;
         if (flags.contains<options_flag::PAGING_STATE>()) {
-            paging_state = service::pager::paging_state::deserialize(read_value(buf));
+            paging_state = service::pager::paging_state::deserialize(read_bytes(buf));
         }
 
         db::consistency_level serial_consistency = db::consistency_level::SERIAL;
@@ -1411,7 +1415,7 @@ std::unique_ptr<cql3::query_options> cql_server::connection::read_options(bytes_
     return std::move(options);
 }
 
-void cql_server::connection::read_name_and_value_list(bytes_view& buf, std::vector<sstring_view>& names, std::vector<bytes_view_opt>& values) {
+void cql_server::connection::read_name_and_value_list(bytes_view& buf, std::vector<sstring_view>& names, std::vector<cql3::raw_value_view>& values) {
     uint16_t size = read_short(buf);
     names.reserve(size);
     values.reserve(size);
@@ -1429,7 +1433,7 @@ void cql_server::connection::read_string_list(bytes_view& buf, std::vector<sstri
     }
 }
 
-void cql_server::connection::read_value_view_list(bytes_view& buf, std::vector<bytes_view_opt>& values) {
+void cql_server::connection::read_value_view_list(bytes_view& buf, std::vector<cql3::raw_value_view>& values) {
     uint16_t size = read_short(buf);
     values.reserve(size);
     for (uint16_t i = 0; i < size; i++) {
@@ -1437,26 +1441,44 @@ void cql_server::connection::read_value_view_list(bytes_view& buf, std::vector<b
     }
 }
 
-bytes_opt cql_server::connection::read_value(bytes_view& buf) {
+cql3::raw_value cql_server::connection::read_value(bytes_view& buf) {
     auto len = read_int(buf);
     if (len < 0) {
-        return {};
+        if (_version < 4) {
+            return cql3::raw_value::make_null();
+        }
+        if (len == -1) {
+            return cql3::raw_value::make_null();
+        } else if (len == -2) {
+            return cql3::raw_value::make_unset_value();
+        } else {
+            throw exceptions::protocol_exception(sprint("invalid value length: %d", len));
+        }
     }
     check_room(buf, len);
     bytes b(reinterpret_cast<const int8_t*>(buf.begin()), len);
     buf.remove_prefix(len);
-    return {std::move(b)};
+    return cql3::raw_value::make_value(std::move(b));
 }
 
-bytes_view_opt cql_server::connection::read_value_view(bytes_view& buf) {
+cql3::raw_value_view cql_server::connection::read_value_view(bytes_view& buf) {
     auto len = read_int(buf);
     if (len < 0) {
-        return {};
+        if (_version < 4) {
+            return cql3::raw_value_view::make_null();
+        }
+        if (len == -1) {
+            return cql3::raw_value_view::make_null();
+        } else if (len == -2) {
+            return cql3::raw_value_view::make_unset_value();
+        } else {
+            throw exceptions::protocol_exception(sprint("invalid value length: %d", len));
+        }
     }
     check_room(buf, len);
     bytes_view bv(reinterpret_cast<const int8_t*>(buf.begin()), len);
     buf.remove_prefix(len);
-    return {std::move(bv)};
+    return cql3::raw_value_view::make_value(std::move(bv));
 }
 
 scattered_message<char> cql_server::response::make_message(uint8_t version) {
@@ -1504,7 +1526,11 @@ std::vector<char> cql_server::response::compress_lz4(const std::vector<char>& bo
     output[1] = (input_len >> 16) & 0xFF;
     output[2] = (input_len >> 8) & 0xFF;
     output[3] = input_len & 0xFF;
+#ifdef HAVE_LZ4_COMPRESS_DEFAULT
+    auto ret = LZ4_compress_default(input, output + 4, input_len, LZ4_compressBound(input_len));
+#else
     auto ret = LZ4_compress(input, output + 4, input_len);
+#endif
     if (ret == 0) {
         throw std::runtime_error("CQL frame LZ4 compression failure");
     }
@@ -1720,6 +1746,10 @@ private:
         VARINT    = 0x000E,
         TIMEUUID  = 0x000F,
         INET      = 0x0010,
+        DATE      = 0x0011,
+        TIME      = 0x0012,
+        SMALLINT  = 0x0013,
+        TINYINT   = 0x0014,
         LIST      = 0x0020,
         MAP       = 0x0021,
         SET       = 0x0022,
@@ -1739,6 +1769,8 @@ public:
         // For compatibility sake, we still return DateType as the timestamp type in resultSet metadata (#5723)
         if (type == date_type) {
             type = timestamp_type;
+        } else if (type == counter_type) {
+            type = long_type;
         }
 
         auto i = type_id_to_type.right.find(type);
@@ -1805,11 +1837,15 @@ thread_local const type_codec::type_id_to_type_type type_codec::type_id_to_type 
     (type_id::DOUBLE    , double_type)
     (type_id::FLOAT     , float_type)
     (type_id::INT       , int32_type)
+    (type_id::TINYINT   , byte_type)
+    (type_id::SMALLINT  , short_type)
     (type_id::TIMESTAMP , timestamp_type)
     (type_id::UUID      , uuid_type)
     (type_id::VARCHAR   , utf8_type)
     (type_id::VARINT    , varint_type)
     (type_id::TIMEUUID  , timeuuid_type)
+    (type_id::DATE      , simple_date_type)
+    (type_id::TIME      , time_type)
     (type_id::INET      , inet_addr_type);
 
 void cql_server::response::write(const cql3::metadata& m) {

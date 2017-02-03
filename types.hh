@@ -23,7 +23,7 @@
 
 #include <experimental/optional>
 #include <boost/functional/hash.hpp>
-#include <iostream>
+#include <iosfwd>
 #include <sstream>
 
 #include "core/sstring.hh"
@@ -310,6 +310,8 @@ public:
     data_value(sstring);
     data_value(const char*);
     data_value(bool);
+    data_value(int8_t);
+    data_value(int16_t);
     data_value(int32_t);
     data_value(int64_t);
     data_value(utils::UUID);
@@ -361,6 +363,7 @@ class serialized_compare;
 class serialized_tri_compare;
 class user_type_impl;
 
+// Unsafe to access across shards unless otherwise noted.
 class abstract_type : public enable_shared_from_this<abstract_type> {
     sstring _name;
 public:
@@ -452,6 +455,7 @@ public:
         serialize(value._value, i);
         return b;
     }
+    // Safe to call across shards
     const sstring& name() const {
         return _name;
     }
@@ -1080,6 +1084,8 @@ abstract_type::as_tri_comparator() const {
 using key_compare = serialized_compare;
 
 // Remember to update type_codec in transport/server.cc and cql3/cql3_type.cc
+extern thread_local const shared_ptr<const abstract_type> byte_type;
+extern thread_local const shared_ptr<const abstract_type> short_type;
 extern thread_local const shared_ptr<const abstract_type> int32_type;
 extern thread_local const shared_ptr<const abstract_type> long_type;
 extern thread_local const shared_ptr<const abstract_type> ascii_type;
@@ -1089,6 +1095,8 @@ extern thread_local const shared_ptr<const abstract_type> boolean_type;
 extern thread_local const shared_ptr<const abstract_type> date_type;
 extern thread_local const shared_ptr<const abstract_type> timeuuid_type;
 extern thread_local const shared_ptr<const abstract_type> timestamp_type;
+extern thread_local const shared_ptr<const abstract_type> simple_date_type;
+extern thread_local const shared_ptr<const abstract_type> time_type;
 extern thread_local const shared_ptr<const abstract_type> uuid_type;
 extern thread_local const shared_ptr<const abstract_type> inet_addr_type;
 extern thread_local const shared_ptr<const abstract_type> float_type;
@@ -1097,6 +1105,18 @@ extern thread_local const shared_ptr<const abstract_type> varint_type;
 extern thread_local const shared_ptr<const abstract_type> decimal_type;
 extern thread_local const shared_ptr<const abstract_type> counter_type;
 extern thread_local const data_type empty_type;
+
+template <>
+inline
+shared_ptr<const abstract_type> data_type_for<int8_t>() {
+    return byte_type;
+}
+
+template <>
+inline
+shared_ptr<const abstract_type> data_type_for<int16_t>() {
+    return short_type;
+}
 
 template <>
 inline
@@ -1476,6 +1496,7 @@ public:
     const bytes _name;
 private:
     std::vector<bytes> _field_names;
+    std::vector<sstring> _string_field_names;
 public:
     using native_type = std::vector<data_value>;
     user_type_impl(sstring keyspace, bytes name, std::vector<bytes> field_names, std::vector<data_type> field_types)
@@ -1483,6 +1504,9 @@ public:
             , _keyspace(keyspace)
             , _name(name)
             , _field_names(field_names) {
+        for (const auto& field_name : _field_names) {
+            _string_field_names.emplace_back(utf8_type->to_string(field_name));
+        }
     }
     static shared_ptr<user_type_impl> get_instance(sstring keyspace, bytes name, std::vector<bytes> field_names, std::vector<data_type> field_types) {
         return ::make_shared<user_type_impl>(std::move(keyspace), std::move(name), std::move(field_names), std::move(field_types));
@@ -1490,6 +1514,7 @@ public:
     data_type field_type(size_t i) const { return type(i); }
     const std::vector<data_type>& field_types() const { return _types; }
     bytes_view field_name(size_t i) const { return _field_names[i]; }
+    sstring field_name_as_string(size_t i) const { return _string_field_names[i]; }
     const std::vector<bytes>& field_names() const { return _field_names; }
     sstring get_name_as_string() const;
     virtual shared_ptr<cql3::cql3_type> as_cql3_type() const override;

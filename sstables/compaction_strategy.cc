@@ -59,13 +59,20 @@ namespace sstables {
 
 extern logging::logger logger;
 
+class incremental_selector_impl {
+public:
+    virtual ~incremental_selector_impl() {}
+    virtual std::pair<dht::token_range, std::vector<shared_sstable>> select(const dht::token& token) = 0;
+};
+
 class sstable_set_impl {
 public:
     virtual ~sstable_set_impl() {}
     virtual std::unique_ptr<sstable_set_impl> clone() const = 0;
-    virtual std::vector<shared_sstable> select(const query::partition_range& range) const = 0;
+    virtual std::vector<shared_sstable> select(const dht::partition_range& range) const = 0;
     virtual void insert(shared_sstable sst) = 0;
     virtual void erase(shared_sstable sst) = 0;
+    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const = 0;
 };
 
 sstable_set::sstable_set(std::unique_ptr<sstable_set_impl> impl, lw_shared_ptr<sstable_list> all)
@@ -93,7 +100,7 @@ sstable_set&
 sstable_set::operator=(sstable_set&&) noexcept = default;
 
 std::vector<shared_sstable>
-sstable_set::select(const query::partition_range& range) const {
+sstable_set::select(const dht::partition_range& range) const {
     return _impl->select(range);
 }
 
@@ -116,6 +123,29 @@ sstable_set::erase(shared_sstable sst) {
 
 sstable_set::~sstable_set() = default;
 
+sstable_set::incremental_selector::incremental_selector(std::unique_ptr<incremental_selector_impl> impl)
+    : _impl(std::move(impl)) {
+}
+
+sstable_set::incremental_selector::~incremental_selector() = default;
+
+sstable_set::incremental_selector::incremental_selector(sstable_set::incremental_selector&&) noexcept = default;
+
+const std::vector<shared_sstable>&
+sstable_set::incremental_selector::select(const dht::token& t) const {
+    if (!_current_token_range || !_current_token_range->contains(t, dht::token_comparator())) {
+        auto&& x = _impl->select(t);
+        _current_token_range = std::move(std::get<0>(x));
+        _current_sstables = std::move(std::get<1>(x));
+    }
+    return _current_sstables;
+}
+
+sstable_set::incremental_selector
+sstable_set::make_incremental_selector() const {
+    return incremental_selector(_impl->make_incremental_selector());
+}
+
 // default sstable_set, not specialized for anything
 class bag_sstable_set : public sstable_set_impl {
     // erasing is slow, but select() is fast
@@ -124,7 +154,7 @@ public:
     virtual std::unique_ptr<sstable_set_impl> clone() const override {
         return std::make_unique<bag_sstable_set>(*this);
     }
-    virtual std::vector<shared_sstable> select(const query::partition_range& range) const override {
+    virtual std::vector<shared_sstable> select(const dht::partition_range& range = query::full_partition_range) const override {
         return _sstables;
     }
     virtual void insert(shared_sstable sst) override {
@@ -133,7 +163,24 @@ public:
     virtual void erase(shared_sstable sst) override {
         _sstables.erase(boost::find(_sstables, sst));
     }
+    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
+    class incremental_selector;
 };
+
+class bag_sstable_set::incremental_selector : public incremental_selector_impl {
+    const std::vector<shared_sstable>& _sstables;
+public:
+    incremental_selector(const std::vector<shared_sstable>& sstables)
+        : _sstables(sstables) {
+    }
+    virtual std::pair<dht::token_range, std::vector<shared_sstable>> select(const dht::token& token) override {
+        return std::make_pair(dht::token_range::make_open_ended_both_sides(), _sstables);
+    }
+};
+
+std::unique_ptr<incremental_selector_impl> bag_sstable_set::make_incremental_selector() const {
+    return std::make_unique<incremental_selector>(_sstables);
+}
 
 // specialized when sstables are partitioned in the token range space
 // e.g. leveled compaction strategy
@@ -146,16 +193,19 @@ private:
     schema_ptr _schema;
     interval_map_type _sstables;
 private:
-    interval_type make_interval(const query::partition_range& range) const {
+    static interval_type make_interval(const schema& s, const dht::partition_range& range) {
         return interval_type::closed(
-                compatible_ring_position(*_schema, range.start()->value()),
-                compatible_ring_position(*_schema, range.end()->value()));
+                compatible_ring_position(s, range.start()->value()),
+                compatible_ring_position(s, range.end()->value()));
+    }
+    interval_type make_interval(const dht::partition_range& range) const {
+        return make_interval(*_schema, range);
     }
     interval_type singular(const dht::ring_position& rp) const {
         auto crp = compatible_ring_position(*_schema, rp);
         return interval_type::closed(crp, crp);
     }
-    std::pair<map_iterator, map_iterator> query(const query::partition_range& range) const {
+    std::pair<map_iterator, map_iterator> query(const dht::partition_range& range) const {
         if (range.start() && range.end()) {
             return _sstables.equal_range(make_interval(range));
         }
@@ -176,7 +226,7 @@ public:
     virtual std::unique_ptr<sstable_set_impl> clone() const override {
         return std::make_unique<partitioned_sstable_set>(*this);
     }
-    virtual std::vector<shared_sstable> select(const query::partition_range& range) const override {
+    virtual std::vector<shared_sstable> select(const dht::partition_range& range) const override {
         auto ipair = query(range);
         auto b = std::move(ipair.first);
         auto e = std::move(ipair.second);
@@ -189,10 +239,10 @@ public:
     virtual void insert(shared_sstable sst) override {
         auto first = sst->get_first_decorated_key().token();
         auto last = sst->get_last_decorated_key().token();
-        using bound = query::partition_range::bound;
+        using bound = dht::partition_range::bound;
         _sstables.add({
                 make_interval(
-                        query::partition_range(
+                        dht::partition_range(
                                 bound(dht::ring_position::starting_at(first)),
                                 bound(dht::ring_position::ending_at(last)))),
                 value_set({sst})});
@@ -200,15 +250,55 @@ public:
     virtual void erase(shared_sstable sst) override {
         auto first = sst->get_first_decorated_key().token();
         auto last = sst->get_last_decorated_key().token();
-        using bound = query::partition_range::bound;
+        using bound = dht::partition_range::bound;
         _sstables.subtract({
                 make_interval(
-                        query::partition_range(
+                        dht::partition_range(
                                 bound(dht::ring_position::starting_at(first)),
                                 bound(dht::ring_position::ending_at(last)))),
                 value_set({sst})});
     }
+    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
+    class incremental_selector;
 };
+
+class partitioned_sstable_set::incremental_selector : public incremental_selector_impl {
+    schema_ptr _schema;
+    map_iterator _it;
+    const map_iterator _end;
+private:
+    static dht::token_range to_token_range(const interval_type& i) {
+        return dht::token_range::make({i.lower().token(), boost::icl::is_left_closed(i.bounds())},
+            {i.upper().token(), boost::icl::is_right_closed(i.bounds())});
+    }
+public:
+    incremental_selector(schema_ptr schema, const interval_map_type& sstables)
+        : _schema(std::move(schema))
+        , _it(sstables.begin())
+        , _end(sstables.end()) {
+    }
+    virtual std::pair<dht::token_range, std::vector<shared_sstable>> select(const dht::token& token) override {
+        auto pr = dht::partition_range::make(dht::ring_position::starting_at(token), dht::ring_position::ending_at(token));
+        auto interval = make_interval(*_schema, std::move(pr));
+
+        while (_it != _end) {
+            if (boost::icl::contains(_it->first, interval)) {
+                return std::make_pair(to_token_range(_it->first), std::vector<shared_sstable>(_it->second.begin(), _it->second.end()));
+            }
+            // we don't want to skip current interval if token lies before it.
+            if (boost::icl::lower_less(interval, _it->first)) {
+                return std::make_pair(dht::token_range::make({token, true}, {_it->first.lower().token(), false}),
+                    std::vector<shared_sstable>());
+            }
+            _it++;
+        }
+        return std::make_pair(dht::token_range::make_open_ended_both_sides(), std::vector<shared_sstable>());
+    }
+};
+
+std::unique_ptr<incremental_selector_impl> partitioned_sstable_set::make_incremental_selector() const {
+    return std::make_unique<incremental_selector>(_schema, _sstables);
+}
 
 class compaction_strategy_impl {
 protected:
@@ -216,6 +306,7 @@ protected:
 public:
     virtual ~compaction_strategy_impl() {}
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) = 0;
+    virtual void notify_completion(const std::vector<lw_shared_ptr<sstable>>& removed, const std::vector<lw_shared_ptr<sstable>>& added) { }
     virtual compaction_strategy_type type() const = 0;
     virtual bool parallel_compaction() const {
         return true;
@@ -368,7 +459,7 @@ class size_tiered_compaction_strategy : public compaction_strategy_impl {
     std::vector<std::pair<sstables::shared_sstable, uint64_t>> create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables) const;
 
     // Group files of similar size into buckets.
-    std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables, unsigned max_threshold) const;
+    std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables) const;
 
     // Maybe return a bucket of sstables to compact
     std::vector<sstables::shared_sstable>
@@ -420,7 +511,7 @@ size_tiered_compaction_strategy::create_sstable_and_length_pairs(const std::vect
 }
 
 std::vector<std::vector<sstables::shared_sstable>>
-size_tiered_compaction_strategy::get_buckets(const std::vector<sstables::shared_sstable>& sstables, unsigned max_threshold) const {
+size_tiered_compaction_strategy::get_buckets(const std::vector<sstables::shared_sstable>& sstables) const {
     // sstables sorted by size of its data file.
     auto sorted_sstables = create_sstable_and_length_pairs(sstables);
 
@@ -442,10 +533,8 @@ size_tiered_compaction_strategy::get_buckets(const std::vector<sstables::shared_
             std::vector<sstables::shared_sstable> bucket = entry.second;
             size_t old_average_size = entry.first;
 
-            if (((size > (old_average_size * _options.bucket_low) && size < (old_average_size * _options.bucket_high))
-                || (size < _options.min_sstable_size && old_average_size < _options.min_sstable_size))
-                && (bucket.size() < max_threshold))
-            {
+            if ((size > (old_average_size * _options.bucket_low) && size < (old_average_size * _options.bucket_high)) ||
+                    (size < _options.min_sstable_size && old_average_size < _options.min_sstable_size)) {
                 size_t total_size = bucket.size() * old_average_size;
                 size_t new_average_size = (total_size + size) / (bucket.size() + 1);
 
@@ -489,7 +578,8 @@ size_tiered_compaction_strategy::most_interesting_bucket(std::vector<std::vector
         // FIXME: the coldest sstables will be trimmed to meet the threshold, so we must add support to this feature
         // by converting SizeTieredCompactionStrategy::trimToThresholdWithHotness.
         // By the time being, we will only compact buckets that meet the threshold.
-        if (bucket.size() >= min_threshold && bucket.size() <= max_threshold) {
+        bucket.resize(std::min(bucket.size(), size_t(max_threshold)));
+        if (bucket.size() >= min_threshold) {
             auto avg = avg_size(bucket);
             pruned_buckets_and_hotness.push_back({ std::move(bucket), avg });
         }
@@ -517,7 +607,7 @@ compaction_descriptor size_tiered_compaction_strategy::get_sstables_for_compacti
 
     // TODO: Add support to filter cold sstables (for reference: SizeTieredCompactionStrategy::filterColdSSTables).
 
-    auto buckets = get_buckets(candidates, max_threshold);
+    auto buckets = get_buckets(candidates);
 
     std::vector<sstables::shared_sstable> most_interesting = most_interesting_bucket(std::move(buckets), min_threshold, max_threshold);
     if (most_interesting.empty()) {
@@ -539,7 +629,7 @@ int64_t size_tiered_compaction_strategy::estimated_pending_compactions(column_fa
         sstables.push_back(entry);
     }
 
-    for (auto& bucket : get_buckets(sstables, max_threshold)) {
+    for (auto& bucket : get_buckets(sstables)) {
         if (bucket.size() >= size_t(min_threshold)) {
             n += std::ceil(double(bucket.size()) / max_threshold);
         }
@@ -556,7 +646,7 @@ std::vector<sstables::shared_sstable> size_tiered_most_interesting_bucket(lw_sha
         sstables.push_back(entry);
     }
 
-    auto buckets = cs.get_buckets(sstables, DEFAULT_MAX_COMPACTION_THRESHOLD);
+    auto buckets = cs.get_buckets(sstables);
 
     std::vector<sstables::shared_sstable> most_interesting = cs.most_interesting_bucket(std::move(buckets),
         DEFAULT_MIN_COMPACTION_THRESHOLD, DEFAULT_MAX_COMPACTION_THRESHOLD);
@@ -570,7 +660,7 @@ size_tiered_most_interesting_bucket(const std::list<sstables::shared_sstable>& c
 
     std::vector<sstables::shared_sstable> sstables(candidates.begin(), candidates.end());
 
-    auto buckets = cs.get_buckets(sstables, DEFAULT_MAX_COMPACTION_THRESHOLD);
+    auto buckets = cs.get_buckets(sstables);
 
     std::vector<sstables::shared_sstable> most_interesting = cs.most_interesting_bucket(std::move(buckets),
         DEFAULT_MIN_COMPACTION_THRESHOLD, DEFAULT_MAX_COMPACTION_THRESHOLD);
@@ -583,6 +673,8 @@ class leveled_compaction_strategy : public compaction_strategy_impl {
     const sstring SSTABLE_SIZE_OPTION = "sstable_size_in_mb";
 
     int32_t _max_sstable_size_in_mb = DEFAULT_MAX_SSTABLE_SIZE_IN_MB;
+    stdx::optional<std::vector<stdx::optional<dht::decorated_key>>> _last_compacted_keys;
+    std::vector<int> _compaction_counter;
 public:
     leveled_compaction_strategy(const std::map<sstring, sstring>& options) {
         using namespace cql3::statements;
@@ -596,9 +688,16 @@ public:
             logger.warn("Max sstable size of {}MB is configured. Testing done for CASSANDRA-5727 indicates that performance improves up to 160MB",
                 _max_sstable_size_in_mb);
         }
+        _compaction_counter.resize(leveled_manifest::MAX_LEVELS);
     }
 
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) override;
+
+    virtual void notify_completion(const std::vector<lw_shared_ptr<sstable>>& removed, const std::vector<lw_shared_ptr<sstable>>& added) override;
+
+    // for each level > 0, get newest sstable and use its last key as last
+    // compacted key for the previous level.
+    void generate_last_compacted_keys(leveled_manifest& manifest);
 
     virtual int64_t estimated_pending_compactions(column_family& cf) const override;
 
@@ -621,7 +720,10 @@ compaction_descriptor leveled_compaction_strategy::get_sstables_for_compaction(c
     // sstable in it may be marked for deletion after compacted.
     // Currently, we create a new manifest whenever it's time for compaction.
     leveled_manifest manifest = leveled_manifest::create(cfs, candidates, _max_sstable_size_in_mb);
-    auto candidate = manifest.get_compaction_candidates();
+    if (!_last_compacted_keys) {
+        generate_last_compacted_keys(manifest);
+    }
+    auto candidate = manifest.get_compaction_candidates(*_last_compacted_keys, _compaction_counter);
 
     if (candidate.sstables.empty()) {
         return sstables::compaction_descriptor();
@@ -630,6 +732,45 @@ compaction_descriptor leveled_compaction_strategy::get_sstables_for_compaction(c
     logger.debug("leveled: Compacting {} out of {} sstables", candidate.sstables.size(), cfs.get_sstables()->size());
 
     return std::move(candidate);
+}
+
+void leveled_compaction_strategy::notify_completion(const std::vector<lw_shared_ptr<sstable>>& removed, const std::vector<lw_shared_ptr<sstable>>& added) {
+    if (removed.empty() || added.empty()) {
+        return;
+    }
+    auto min_level = std::numeric_limits<uint32_t>::max();
+    for (auto& sstable : removed) {
+        min_level = std::min(min_level, sstable->get_sstable_level());
+    }
+
+    const sstables::sstable *last = nullptr;
+    for (auto& candidate : added) {
+        if (!last || last->compare_by_first_key(*candidate) < 0) {
+            last = &*candidate;
+        }
+    }
+    _last_compacted_keys.value().at(min_level) = last->get_last_decorated_key();
+}
+
+void leveled_compaction_strategy::generate_last_compacted_keys(leveled_manifest& manifest) {
+    std::vector<stdx::optional<dht::decorated_key>> last_compacted_keys(leveled_manifest::MAX_LEVELS);
+    for (auto i = 0; i < leveled_manifest::MAX_LEVELS - 1; i++) {
+        if (manifest.get_level(i + 1).empty()) {
+            continue;
+        }
+
+        const sstables::sstable* sstable_with_last_compacted_key = nullptr;
+        stdx::optional<db_clock::time_point> max_creation_time;
+        for (auto& sst : manifest.get_level(i + 1)) {
+            auto wtime = sst->data_file_write_time();
+            if (!max_creation_time || wtime >= *max_creation_time) {
+                sstable_with_last_compacted_key = &*sst;
+                max_creation_time = wtime;
+            }
+        }
+        last_compacted_keys[i] = sstable_with_last_compacted_key->get_last_decorated_key();
+    }
+    _last_compacted_keys = std::move(last_compacted_keys);
 }
 
 int64_t leveled_compaction_strategy::estimated_pending_compactions(column_family& cf) const {
@@ -684,6 +825,10 @@ compaction_strategy_type compaction_strategy::type() const {
 
 compaction_descriptor compaction_strategy::get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) {
     return _compaction_strategy_impl->get_sstables_for_compaction(cfs, std::move(candidates));
+}
+
+void compaction_strategy::notify_completion(const std::vector<lw_shared_ptr<sstable>>& removed, const std::vector<lw_shared_ptr<sstable>>& added) {
+    _compaction_strategy_impl->notify_completion(removed, added);
 }
 
 bool compaction_strategy::parallel_compaction() const {

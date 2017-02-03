@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/range/irange.hpp>
 #include <boost/range/adaptors.hpp>
@@ -621,6 +620,17 @@ SEASTAR_TEST_CASE(test_partition_range_queries_with_bounds) {
             }).then([keys, tokens, &e] {
                 return e.execute_cql(sprint("select k from cf where token(k) >= %ld and token(k) <= %ld;", tokens[4], tokens[2])).then([keys](auto msg) {
                     assert_that(msg).is_rows().is_empty();
+                });
+            }).then([keys, tokens, &e] {
+                auto min_token = std::numeric_limits<int64_t>::min();
+                return e.execute_cql(sprint("select k from cf where token(k) > %ld and token (k) < %ld;", min_token, min_token)).then([keys](auto msg) {
+                    assert_that(msg).is_rows().with_rows({
+                        {keys[0]},
+                        {keys[1]},
+                        {keys[2]},
+                        {keys[3]},
+                        {keys[4]}
+                    });
                 });
             });
         });
@@ -1348,11 +1358,15 @@ SEASTAR_TEST_CASE(test_types) {
                     "    m varchar,"
                     "    n varint,"
                     "    o decimal,"
+                    "    p tinyint,"
+                    "    q smallint,"
+                    "    r date,"
+                    "    s time,"
                     ");").discard_result();
         }).then([&e] {
             e.require_table_exists("ks", "all_types");
             return e.execute_cql(
-                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VALUES ("
+                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VALUES ("
                     "    'ascii',"
                     "    123456789,"
                     "    0xdeadbeef,"
@@ -1367,7 +1381,11 @@ SEASTAR_TEST_CASE(test_types) {
                     "    d2177dd0-eaa2-11de-a572-001b779c76e3,"
                     "    'varchar',"
                     "    123,"
-                    "    1.23"
+                    "    1.23,"
+                    "    3,"
+                    "    3,"
+                    "    '1970-01-02',"
+                    "    '00:00:00.000000001'"
                     ");").discard_result();
         }).then([&e] {
             return e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii'");
@@ -1391,11 +1409,15 @@ SEASTAR_TEST_CASE(test_types) {
                     timeuuid_type->decompose(utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"))),
                     uuid_type->decompose(utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"))),
                     utf8_type->decompose(sstring("varchar")), varint_type->decompose(boost::multiprecision::cpp_int(123)),
-                    decimal_type->decompose(big_decimal { 2, boost::multiprecision::cpp_int(123) })
+                    decimal_type->decompose(big_decimal { 2, boost::multiprecision::cpp_int(123) }),
+                    byte_type->decompose(int8_t(3)),
+                    short_type->decompose(int16_t(3)),
+                    simple_date_type->decompose(int32_t(0x80000001)),
+                    time_type->decompose(int64_t(0x0000000000000001)),
                 }
             });
             return e.execute_cql(
-                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VALUES ("
+                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VALUES ("
                     "    blobAsAscii(asciiAsBlob('ascii2')),"
                     "    blobAsBigint(bigintAsBlob(123456789)),"
                     "    bigintAsBlob(12),"
@@ -1409,7 +1431,11 @@ SEASTAR_TEST_CASE(test_types) {
                     "    blobAsTimeuuid(timeuuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
                     "    blobAsUuid(uuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
                     "    blobAsVarchar(varcharAsBlob('varchar')), blobAsVarint(varintAsBlob(123)),"
-                    "    blobAsDecimal(decimalAsBlob(1.23))"
+                    "    blobAsDecimal(decimalAsBlob(1.23)),"
+                    "    blobAsTinyint(tinyintAsBlob(3)),"
+                    "    blobAsSmallint(smallintAsBlob(3)),"
+                    "    blobAsDate(dateAsBlob('1970-01-02')),"
+                    "    blobAsTime(timeAsBlob('00:00:00.000000001'))"
                     ");").discard_result();
         }).then([&e] {
              return e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii2'");
@@ -1433,7 +1459,11 @@ SEASTAR_TEST_CASE(test_types) {
                     timeuuid_type->decompose(utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"))),
                     uuid_type->decompose(utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"))),
                     utf8_type->decompose(sstring("varchar")), varint_type->decompose(boost::multiprecision::cpp_int(123)),
-                    decimal_type->decompose(big_decimal { 2, boost::multiprecision::cpp_int(123) })
+                    decimal_type->decompose(big_decimal { 2, boost::multiprecision::cpp_int(123) }),
+                    byte_type->decompose(int8_t(3)),
+                    short_type->decompose(int16_t(3)),
+                    simple_date_type->decompose(int32_t(0x80000001)),
+                    time_type->decompose(int64_t(0x0000000000000001)),
                 }
             });
         });

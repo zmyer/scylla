@@ -38,6 +38,7 @@
  * You should have received a copy of the GNU General Public License
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <seastar/core/metrics.hh>
 #include "tracing/tracing.hh"
 #include "utils/class_registrator.hh"
 #include "tracing/trace_state.hh"
@@ -55,65 +56,62 @@ std::vector<sstring> trace_type_names = {
     "REPAIR"
 };
 
-tracing::tracing(const sstring& tracing_backend_helper_class_name)
+tracing::tracing(sstring tracing_backend_helper_class_name)
         : _write_timer([this] { write_timer_callback(); })
         , _thread_name(seastar::format("shard {:d}", engine().cpu_id()))
-        , _registrations{
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "dropped_sessions")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE, stats.dropped_sessions)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "dropped_records")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE, stats.dropped_records)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "trace_records_count")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE, stats.trace_records_count)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "trace_errors")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE, stats.trace_errors)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "queue_length", "active_sessions")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE, _active_sessions)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "queue_length", "cached_records")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE, _cached_records)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "queue_length", "pending_for_write_records")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE, _pending_for_write_records_count)),
-            scollectd::add_polled_metric(scollectd::type_instance_id("tracing"
-                    , scollectd::per_cpu_plugin_instance
-                    , "queue_length", "flushing_records")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE, _flushing_records))}
+        , _tracing_backend_helper_class_name(std::move(tracing_backend_helper_class_name))
         , _gen(std::random_device()())
         , _slow_query_duration_threshold(default_slow_query_duraion_threshold)
         , _slow_query_record_ttl(default_slow_query_record_ttl) {
-    try {
-        _tracing_backend_helper_ptr = create_object<i_tracing_backend_helper>(tracing_backend_helper_class_name, *this);
-    } catch (no_such_class& e) {
-        tracing_logger.error("Can't create tracing backend helper {}: not supported", tracing_backend_helper_class_name);
-        throw;
-    } catch (...) {
-        throw;
-    }
+    namespace sm = seastar::metrics;
+
+    _metrics.add_group("tracing", {
+        sm::make_derive("dropped_sessions", stats.dropped_sessions,
+                        sm::description("Counts a number of dropped sessions due to too many pending sessions/records. "
+                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")),
+
+        sm::make_derive("dropped_records", stats.dropped_records,
+                        sm::description("Counts a number of dropped records due to too many pending records. "
+                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")),
+
+        sm::make_derive("trace_records_count", stats.trace_records_count,
+                        sm::description("This metric is a rate of tracing records generation.")),
+
+        sm::make_derive("trace_errors", stats.trace_errors,
+                        sm::description("Counts a number of trace records dropped due to an error (e.g. OOM).")),
+
+        sm::make_gauge("active_sessions", _active_sessions,
+                        sm::description("Holds a number of a currently active tracing sessions.")),
+
+        sm::make_gauge("cached_records", _cached_records,
+                        sm::description(seastar::format("Holds a number of tracing records cached in the tracing sessions that are not going to be written in the next write event. "
+                                                        "If sum of this metric, pending_for_write_records and flushing_records is close to {} we are likely to start dropping tracing records.", max_pending_trace_records + write_event_records_threshold))),
+
+        sm::make_gauge("pending_for_write_records", _pending_for_write_records_count,
+                        sm::description(seastar::format("Holds a number of tracing records that are going to be written in the next write event. "
+                                                        "If sum of this metric, cached_records and flushing_records is close to {} we are likely to start dropping tracing records.", max_pending_trace_records + write_event_records_threshold))),
+
+        sm::make_gauge("flushing_records", _flushing_records,
+                        sm::description(seastar::format("Holds a number of tracing records that currently being written to the I/O backend. "
+                                                        "If sum of this metric, cached_records and pending_for_write_records is close to {} we are likely to start dropping tracing records.", max_pending_trace_records + write_event_records_threshold))),
+    });
 }
 
-future<> tracing::create_tracing(const sstring& tracing_backend_class_name) {
-    return tracing_instance().start(tracing_backend_class_name).then([] {
-        return tracing_instance().invoke_on_all([] (tracing& local_tracing) {
-            return local_tracing.start();
-        });
+future<> tracing::create_tracing(sstring tracing_backend_class_name) {
+    return tracing_instance().start(std::move(tracing_backend_class_name));
+}
+
+future<> tracing::start_tracing() {
+    return tracing_instance().invoke_on_all([] (tracing& local_tracing) {
+        return local_tracing.start();
     });
 }
 
 trace_state_ptr tracing::create_session(trace_type type, trace_state_props_set props) {
-    trace_state_ptr tstate;
+    if (!started()) {
+        return trace_state_ptr();
+    }
+
     try {
         // Don't create a session if its records are likely to be dropped
         if (!may_create_new_session()) {
@@ -129,6 +127,10 @@ trace_state_ptr tracing::create_session(trace_type type, trace_state_props_set p
 }
 
 trace_state_ptr tracing::create_session(const trace_info& secondary_session_info) {
+    if (!started()) {
+        return trace_state_ptr();
+    }
+
     try {
         // Don't create a session if its records are likely to be dropped
         if (!may_create_new_session(secondary_session_info.session_id)) {
@@ -144,7 +146,17 @@ trace_state_ptr tracing::create_session(const trace_info& secondary_session_info
 }
 
 future<> tracing::start() {
+    try {
+        _tracing_backend_helper_ptr = create_object<i_tracing_backend_helper>(_tracing_backend_helper_class_name, *this);
+    } catch (no_such_class& e) {
+        tracing_logger.error("Can't create tracing backend helper {}: not supported", _tracing_backend_helper_class_name);
+        throw;
+    } catch (...) {
+        throw;
+    }
+
     return _tracing_backend_helper_ptr->start().then([this] {
+        _down = false;
         _write_timer.arm(write_period);
     });
 }
@@ -183,7 +195,7 @@ future<> tracing::stop() {
 
 void tracing::set_trace_probability(double p) {
     if (p < 0 || p > 1) {
-        throw std::invalid_argument("trace probability must be in a [0,1] range");
+        throw std::out_of_range("trace probability must be in a [0,1] range");
     }
 
     _trace_probability = p;

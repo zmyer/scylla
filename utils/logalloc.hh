@@ -21,8 +21,7 @@
 
 #pragma once
 
-#include <bits/unique_ptr.h>
-#include <seastar/core/scollectd.hh>
+#include <memory>
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -30,6 +29,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/circular_buffer.hh>
+#include <seastar/core/expiring_fifo.hh>
 #include "allocation_strategy.hh"
 #include <boost/heap/binomial_heap.hpp>
 
@@ -61,38 +61,77 @@ using eviction_fn = std::function<memory::reclaiming_result()>;
 class region_group_reclaimer {
 protected:
     size_t _threshold;
+    size_t _soft_limit;
     bool _under_pressure = false;
-    virtual void start_reclaiming() {}
-    virtual void stop_reclaiming() {}
+    bool _under_soft_pressure = false;
+    // The following restrictions apply to implementations of start_reclaiming() and stop_reclaiming():
+    //
+    //  - must not use any region or region_group objects, because they're invoked synchronously
+    //    with operations on those.
+    //
+    //  - must be noexcept, because they're called on the free path.
+    //
+    //  - the implementation may be called synchronously with any operation
+    //    which allocates memory, because these are called by memory reclaimer.
+    //    In particular, the implementation should not depend on memory allocation
+    //    because that may fail when in reclaiming context.
+    //
+    virtual void start_reclaiming() noexcept {}
+    virtual void stop_reclaiming() noexcept {}
 public:
     bool under_pressure() const {
         return _under_pressure;
     }
 
-    void notify_pressure() {
-        if (!_under_pressure) {
-            _under_pressure = true;
+    bool over_soft_limit() const {
+        return _under_soft_pressure;
+    }
+
+    void notify_soft_pressure() noexcept {
+        if (!_under_soft_pressure) {
+            _under_soft_pressure = true;
             start_reclaiming();
         }
     }
 
-    void notify_relief() {
-        if (_under_pressure) {
-            _under_pressure = false;
+    void notify_soft_relief() noexcept {
+        if (_under_soft_pressure) {
+            _under_soft_pressure = false;
             stop_reclaiming();
         }
     }
 
-    region_group_reclaimer(size_t threshold = std::numeric_limits<size_t>::max()) : _threshold(threshold) {}
+    void notify_pressure() noexcept {
+        _under_pressure = true;
+    }
+
+    void notify_relief() noexcept {
+        _under_pressure = false;
+    }
+
+    region_group_reclaimer()
+        : _threshold(std::numeric_limits<size_t>::max()), _soft_limit(std::numeric_limits<size_t>::max()) {}
+    region_group_reclaimer(size_t threshold)
+        : _threshold(threshold), _soft_limit(threshold) {}
+    region_group_reclaimer(size_t threshold, size_t soft)
+        : _threshold(threshold), _soft_limit(soft) {
+        assert(_soft_limit <= _threshold);
+    }
+
     virtual ~region_group_reclaimer() {}
 
     size_t throttle_threshold() const {
         return _threshold;
     }
+    size_t soft_limit_threshold() const {
+        return _soft_limit;
+    }
 };
 
 // Groups regions for the purpose of statistics.  Can be nested.
 class region_group {
+    using timeout_clock = lowres_clock;
+
     static region_group_reclaimer no_reclaimer;
 
     struct region_evictable_occupancy_ascending_less_comparator {
@@ -147,6 +186,7 @@ class region_group {
     struct allocating_function {
         virtual ~allocating_function() = default;
         virtual void allocate() = 0;
+        virtual void fail(std::exception_ptr) = 0;
     };
 
     template <typename Func>
@@ -158,10 +198,17 @@ class region_group {
         void allocate() override {
             futurator::apply(func).forward_to(std::move(pr));
         }
+        void fail(std::exception_ptr e) override {
+            pr.set_exception(e);
+        }
         concrete_allocating_function(Func&& func) : func(std::forward<Func>(func)) {}
         typename futurator::type get_future() {
             return pr.get_future();
         }
+    };
+
+    struct on_request_expiry {
+        void operator()(std::unique_ptr<allocating_function>&) noexcept;
     };
 
     // It is a more common idiom to just hold the promises in the circular buffer and make them
@@ -174,7 +221,9 @@ class region_group {
     //
     // This allows us to easily provide strong execution guarantees while keeping all re-check
     // complication in release_requests and keep the main request execution path simpler.
-    circular_buffer<std::unique_ptr<allocating_function>> _blocked_requests;
+    expiring_fifo<std::unique_ptr<allocating_function>, on_request_expiry, timeout_clock> _blocked_requests;
+
+    uint64_t _blocked_requests_counter = 0;
 
     // All requests waiting for execution are kept in _blocked_requests (explained above) in the
     // region_group they were executed against. However, it could be that they are blocked not due
@@ -188,9 +237,13 @@ class region_group {
     // a different ancestor)
     std::experimental::optional<shared_promise<>> _descendant_blocked_requests = {};
 
-    region_group* _waiting_on_ancestor = nullptr;
-    seastar::gate _asynchronous_gate;
+    condition_variable _relief;
+    future<> _releaser;
     bool _shutdown_requested = false;
+
+    bool reclaimer_can_block() const;
+    future<> start_releaser();
+    void notify_relief();
 public:
     // When creating a region_group, one can specify an optional throttle_threshold parameter. This
     // parameter won't affect normal allocations, but an API is provided, through the region_group's
@@ -198,17 +251,13 @@ public:
     // the total memory for the region group (and all of its parents) is lower or equal to the
     // region_group's throttle_treshold (and respectively for its parents).
     region_group(region_group_reclaimer& reclaimer = no_reclaimer) : region_group(nullptr, reclaimer) {}
-    region_group(region_group* parent, region_group_reclaimer& reclaimer = no_reclaimer) : _parent(parent), _reclaimer(reclaimer) {
-        if (_parent) {
-            _parent->add(this);
-        }
-    }
+    region_group(region_group* parent, region_group_reclaimer& reclaimer = no_reclaimer);
     region_group(region_group&& o) = delete;
     region_group(const region_group&) = delete;
     ~region_group() {
         // If we set a throttle threshold, we'd be postponing many operations. So shutdown must be
         // called.
-        if (_reclaimer.throttle_threshold() != std::numeric_limits<size_t>::max()) {
+        if (reclaimer_can_block()) {
             assert(_shutdown_requested);
         }
         if (_parent) {
@@ -220,19 +269,7 @@ public:
     size_t memory_used() const {
         return _total_memory;
     }
-    void update(ssize_t delta) {
-        do_for_each_parent(this, [delta] (auto rg) mutable {
-            rg->update_maximal_rg();
-            rg->_total_memory += delta;
-            // It is okay to call release_requests for a region_group that can't allow execution.
-            // But that can generate various spurious messages to groups waiting on us that will be
-            // then woken up just so they can go to wait again. So let's filter that.
-            if (rg->execution_permitted()) {
-                rg->release_requests();
-            }
-            return stop_iteration::no;
-        });
-    }
+    void update(ssize_t delta);
 
     // It would be easier to call update, but it is unfortunately broken in boost versions up to at
     // least 1.59.
@@ -268,43 +305,28 @@ public:
     // Requests that are not allowed for execution are queued and released in FIFO order within the
     // same region_group, but no guarantees are made regarding release ordering across different
     // region_groups.
+    //
+    // When timeout is reached first, the returned future is resolved with timed_out_error exception.
     template <typename Func>
-    futurize_t<std::result_of_t<Func()>> run_when_memory_available(Func&& func) {
+    futurize_t<std::result_of_t<Func()>> run_when_memory_available(Func&& func, timeout_clock::time_point timeout = timeout_clock::time_point::max()) {
         // We disallow future-returning functions here, because otherwise memory may be available
         // when we start executing it, but no longer available in the middle of the execution.
         static_assert(!is_future<std::result_of_t<Func()>>::value, "future-returning functions are not permitted.");
         using futurator = futurize<std::result_of_t<Func()>>;
 
         auto blocked_at = do_for_each_parent(this, [] (auto rg) {
-            return (rg->_blocked_requests.empty() && rg->execution_permitted()) ? stop_iteration::no : stop_iteration::yes;
+            return (rg->_blocked_requests.empty() && !rg->under_pressure()) ? stop_iteration::no : stop_iteration::yes;
         });
 
         if (!blocked_at) {
             return futurator::apply(func);
         }
-        subscribe_for_ancestor_available_memory_notification(blocked_at);
 
         auto fn = std::make_unique<concrete_allocating_function<Func>>(std::forward<Func>(func));
         auto fut = fn->get_future();
-        _blocked_requests.push_back(std::move(fn));
+        _blocked_requests.push_back(std::move(fn), timeout);
+        ++_blocked_requests_counter;
 
-        // This is called here, and not at update(), for two reasons: the first, is that things that
-        // are done during the free() path should be done carefuly, in the sense that they can
-        // trigger another update call and put us in a loop. Not to mention we would like to keep
-        // those from having exceptions. We solve that for release_requests by using later(), but in
-        // here we can do away with that need altogether.
-        //
-        // Second and most important, until we actually block a request, the pressure condition may
-        // very well be transient. There are opportunities for compactions, the condition can go
-        // away on its own, etc.
-        //
-        // The reason we check execution permitted(), is that we'll still block requests if we have
-        // free memory but existing requests in the queue. That is so we can keep our FIFO ordering
-        // guarantee. So we need to distinguish here the case in which we're blocking merely to
-        // serialize requests, so that the caller does not evict more than it should.
-        if (!blocked_at->execution_permitted()) {
-            blocked_at->_reclaimer.notify_pressure();
-        }
         return fut;
     }
 
@@ -314,48 +336,24 @@ public:
     region* get_largest_region();
 
     // Shutdown is mandatory for every user who has set a threshold
+    // Can be called at most once.
     future<> shutdown() {
         _shutdown_requested = true;
-        return _asynchronous_gate.close();
+        _relief.signal();
+        return std::move(_releaser);
+    }
+
+    size_t blocked_requests() {
+        return _blocked_requests.size();
+    }
+
+    uint64_t blocked_requests_counter() const {
+        return _blocked_requests_counter;
     }
 private:
-    // Make sure we get a notification and can call release_requests when one of our ancestors that
-    // used to block us is no longer under memory pressure.
-    void subscribe_for_ancestor_available_memory_notification(region_group *ancestor) {
-        if ((this == ancestor) || (_waiting_on_ancestor)) {
-            return; // already subscribed, or no need to
-        }
-
-        _waiting_on_ancestor = ancestor;
-
-        with_gate(_asynchronous_gate, [this] {
-            // We reevaluate _waiting_on_ancestor here so we make sure there is no deferring point
-            // between determining the ancestor and registering with it for a notification. We start
-            // with _waiting_on_ancestor set to the initial value, and after we are notified, we
-            // will set _waiting_on_ancestor to nullptr to force this lambda to reevaluate it.
-            auto evaluate_ancestor_and_stop = [this] {
-                if (!_waiting_on_ancestor) {
-                    auto new_blocking_point = do_for_each_parent(this, [] (auto rg) {
-                        return (rg->execution_permitted()) ? stop_iteration::no : stop_iteration::yes;
-                    });
-                    if (!new_blocking_point) {
-                        release_requests();
-                    }
-                    _waiting_on_ancestor = (new_blocking_point == this) ? nullptr : new_blocking_point;
-                }
-                return _waiting_on_ancestor == nullptr;
-            };
-
-            return do_until(evaluate_ancestor_and_stop, [this] {
-                if (!_waiting_on_ancestor->_descendant_blocked_requests) {
-                    _waiting_on_ancestor->_descendant_blocked_requests = shared_promise<>();
-                }
-                return _waiting_on_ancestor->_descendant_blocked_requests->get_shared_future().then([this] {
-                    _waiting_on_ancestor = nullptr;
-                });
-            });
-        });
-    }
+    // Returns true if and only if constraints of this group are not violated.
+    // That's taking into account any constraints imposed by enclosing (parent) groups.
+    bool execution_permitted() noexcept;
 
     // Executes the function func for each region_group upwards in the hierarchy, starting with the
     // parameter node. The function func may return stop_iteration::no, in which case it proceeds to
@@ -375,11 +373,10 @@ private:
         }
         return nullptr;
     }
-    inline bool execution_permitted() const {
-        return _total_memory <= _reclaimer.throttle_threshold();
-    }
 
-    void release_requests() noexcept;
+    inline bool under_pressure() const {
+        return _reclaimer.under_pressure();
+    }
 
     uint64_t top_region_evictable_space() const;
 
@@ -444,6 +441,7 @@ public:
     reactor::idle_cpu_handler_result compact_on_idle(reactor::work_waiting_on_reactor);
 
     // Compacts as much as possible. Very expensive, mainly for testing.
+    // Guarantees that every live object from reclaimable regions will be moved.
     // Invalidates references to objects in all compactible and evictable regions.
     void full_compaction();
 
@@ -562,6 +560,8 @@ public:
 
     allocation_strategy& allocator();
 
+    region_group* group();
+
     // Merges another region into this region. The other region is left empty.
     // Doesn't invalidate references to allocated objects.
     void merge(region& other);
@@ -569,6 +569,9 @@ public:
     // Compacts everything. Mainly for testing.
     // Invalidates references to allocated objects.
     void full_compaction();
+
+    // Runs eviction function once. Mainly for testing.
+    memory::reclaiming_result evict_some();
 
     // Changes the reclaimability state of this region. When region is not
     // reclaimable, it won't be considered by tracker::reclaim(). By default region is

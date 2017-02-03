@@ -39,7 +39,7 @@
 #include <unordered_map>
 #include <map>
 #include <set>
-#include <iostream>
+#include <iosfwd>
 #include <boost/functional/hash.hpp>
 #include <boost/range/algorithm/find.hpp>
 #include <experimental/optional>
@@ -70,10 +70,15 @@
 #include "utils/estimated_histogram.hh"
 #include "sstables/compaction.hh"
 #include "sstables/sstable_set.hh"
-#include "key_reader.hh"
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include "tracing/trace_state.hh"
+#include <boost/intrusive/parent_from_member.hpp>
+#include "db/view/view.hh"
+
+class cell_locker;
+class locked_cell;
 
 class frozen_mutation;
 class reconcilable_result;
@@ -118,44 +123,93 @@ class dirty_memory_manager: public logalloc::region_group_reclaimer {
     // memtable is totally gone. That means that if we have throttled requests, they will stay
     // throttled for a long time. Even when we have virtual dirty, that only provides a rough
     // estimate, and we can't release requests that early.
-    //
-    // Ideally, we'd allow one memtable flush per shard (or per database object), and write-behind
-    // would take care of the rest. But that still has issues, so we'll limit parallelism to some
-    // number (4), that we will hopefully reduce to 1 when write behind works.
-    //
-    // When streaming is going on, we'll separate half of that for the streaming code, which
-    // effectively increases the total to 6. That is a bit ugly and a bit redundant with the I/O
-    // Scheduler, but it's the easiest way not to hurt the common case (no streaming) and will have
-    // to do for the moment. Hopefully we can set both to 1 soon (with write behind)
-    //
-    // FIXME: enable write behind and set both to 1. Right now we will take advantage of the fact
-    // that memtables and streaming will use different specialized classes here and set them as
-    // default values here.
-    size_t _concurrency;
     semaphore _flush_serializer;
+    // We will accept a new flush before another one ends, once it is done with the data write.
+    // That is so we can keep the disk always busy. But there is still some background work that is
+    // left to be done. Mostly, update the caches and seal the auxiliary components of the SSTable.
+    // This semaphore will cap the amount of background work that we have. Note that we're not
+    // overly concerned about memtable memory, because dirty memory will put a limit to that. This
+    // is mostly about dangling continuations. So that doesn't have to be a small number.
+    static constexpr unsigned _max_background_work = 20;
+    semaphore _background_work_flush_serializer = { _max_background_work };
+    condition_variable _should_flush;
+    int64_t _dirty_bytes_released_pre_accounted = 0;
 
-    seastar::gate _waiting_flush_gate;
-    std::vector<shared_memtable> _pending_flushes;
-    void maybe_do_active_flush();
-protected:
-    virtual memtable_list& get_memtable_list(column_family& cf) = 0;
-    virtual void start_reclaiming() override;
+    future<> flush_when_needed();
+    struct flush_permit {
+        semaphore_units<> permit;
+
+        flush_permit(semaphore_units<>&& permit) : permit(std::move(permit)) {}
+    };
+
+    // We need to start a flush before the current one finishes, otherwise
+    // we'll have a period without significant disk activity when the current
+    // SSTable is being sealed, the caches are being updated, etc. To do that
+    // we need to keep track of who is it that we are flushing this memory from.
+    std::unordered_map<const logalloc::region*, flush_permit> _flush_manager;
+
+    future<> _waiting_flush;
+    virtual void start_reclaiming() noexcept override;
+
+    bool has_pressure() const {
+        return over_soft_limit();
+    }
+
+    seastar::metrics::metric_groups _metrics;
 public:
+    void setup_collectd(sstring namestr);
+
     future<> shutdown();
 
-    dirty_memory_manager(database* db, size_t threshold, size_t concurrency)
-                                           : logalloc::region_group_reclaimer(threshold)
-                                           , _db(db)
-                                           , _region_group(*this)
-                                           , _concurrency(concurrency)
-                                           , _flush_serializer(concurrency) {}
+    // Limits and pressure conditions:
+    // ===============================
+    //
+    // Virtual Dirty
+    // -------------
+    // We can't free memory until the whole memtable is flushed because we need to keep it in memory
+    // until the end, but we can fake freeing memory. When we are done with an element of the
+    // memtable, we will update the region group pretending memory just went down by that amount.
+    //
+    // Because the amount of memory that we pretend to free should be close enough to the actual
+    // memory used by the memtables, that effectively creates two sub-regions inside the dirty
+    // region group, of equal size. In the worst case, we will have <memtable_total_space> dirty
+    // bytes used, and half of that already virtually freed.
+    //
+    // Hard Limit
+    // ----------
+    // The total space that can be used by memtables in each group is defined by the threshold, but
+    // we will only allow the region_group to grow to half of that. This is because of virtual_dirty
+    // as explained above. Because virtual dirty is implemented by reducing the usage in the
+    // region_group directly on partition written, we want to throttle every time half of the memory
+    // as seen by the region_group. To achieve that we need to set the hard limit (first parameter
+    // of the region_group_reclaimer) to 1/2 of the user-supplied threshold
+    //
+    // Soft Limit
+    // ----------
+    // When the soft limit is hit, no throttle happens. The soft limit exists because we don't want
+    // to start flushing only when the limit is hit, but a bit earlier instead. If we were to start
+    // flushing only when the hard limit is hit, workloads in which the disk is fast enough to cope
+    // would see latency added to some requests unnecessarily.
+    //
+    // We then set the soft limit to 80 % of the virtual dirty hard limit, which is equal to 40 % of
+    // the user-supplied threshold.
+    dirty_memory_manager(database& db, size_t threshold)
+        : logalloc::region_group_reclaimer(threshold / 2, threshold * 0.40)
+        , _db(&db)
+        , _region_group(*this)
+        , _flush_serializer(1)
+        , _waiting_flush(flush_when_needed()) {}
 
-    dirty_memory_manager(database* db, dirty_memory_manager *parent, size_t threshold, size_t concurrency)
-                                                                         : logalloc::region_group_reclaimer(threshold)
-                                                                         , _db(db)
-                                                                         , _region_group(&parent->_region_group, *this)
-                                                                         , _concurrency(concurrency)
-                                                                         , _flush_serializer(concurrency) {}
+    dirty_memory_manager() : logalloc::region_group_reclaimer()
+        , _db(nullptr)
+        , _region_group(*this)
+        , _flush_serializer(1)
+        , _waiting_flush(make_ready_future<>()) {}
+
+    static dirty_memory_manager& from_region_group(logalloc::region_group *rg) {
+        return *(boost::intrusive::get_parent_from_member(rg, &dirty_memory_manager::_region_group));
+    }
+
     logalloc::region_group& region_group() {
         return _region_group;
     }
@@ -164,33 +218,52 @@ public:
         return _region_group;
     }
 
-    template <typename Func>
-    future<> serialize_flush(Func&& func) {
-        return seastar::with_gate(_waiting_flush_gate,  [this, func] () mutable {
-            return with_semaphore(_flush_serializer, 1, func).finally([this] {
-                maybe_do_active_flush();
-            });
-        });
+    void revert_potentially_cleaned_up_memory(logalloc::region* from, int64_t delta) {
+        _region_group.update(delta);
+        _dirty_bytes_released_pre_accounted -= delta;
+    }
+
+    void account_potentially_cleaned_up_memory(logalloc::region* from, int64_t delta) {
+        _region_group.update(-delta);
+        _dirty_bytes_released_pre_accounted += delta;
+    }
+
+    // This can be called multiple times during the lifetime of the region, and should always
+    // ultimately be called after the flush ends. However, some flushers may decide to call it
+    // earlier. For instance, the normal memtables sealing function will call this before updating
+    // the cache.
+    //
+    // Also, for sealing methods like the normal memtable sealing method - that may retry after a
+    // failed write, calling this method after the attempt is completed with success or failure is
+    // mandatory. That's because the new attempt will create a new flush reader for the same
+    // SSTable, so we need to make sure that we revert the old charges.
+    void remove_from_flush_manager(const logalloc::region *region) {
+        auto it = _flush_manager.find(region);
+        if (it != _flush_manager.end()) {
+            _flush_manager.erase(it);
+        }
+    }
+
+    void add_to_flush_manager(const logalloc::region *region, flush_permit&& permit) {
+        _flush_manager.emplace(region, std::move(permit));
+    }
+
+    size_t real_dirty_memory() const {
+        return _region_group.memory_used() + _dirty_bytes_released_pre_accounted;
+    }
+
+    size_t virtual_dirty_memory() const {
+        return _region_group.memory_used();
+    }
+
+    future<> flush_one(memtable_list& cf, semaphore_units<> permit);
+
+    future<semaphore_units<>> get_flush_permit() {
+        return get_units(_flush_serializer, 1);
     }
 };
 
-class streaming_dirty_memory_manager: public dirty_memory_manager {
-    virtual memtable_list& get_memtable_list(column_family& cf) override;
-public:
-    streaming_dirty_memory_manager(database& db, dirty_memory_manager *parent, size_t threshold) : dirty_memory_manager(&db, parent, threshold, 2) {}
-};
-
-class memtable_dirty_memory_manager: public dirty_memory_manager {
-    virtual memtable_list& get_memtable_list(column_family& cf) override;
-public:
-    memtable_dirty_memory_manager(database& db, dirty_memory_manager* parent, size_t threshold) : dirty_memory_manager(&db, parent, threshold, 4) {}
-    // This constructor will be called for the system tables (no parent). Its flushes are usually drive by us
-    // and not the user, and tend to be small in size. So we'll allow only two slots.
-    memtable_dirty_memory_manager(database& db, size_t threshold) : dirty_memory_manager(&db, threshold, 2) {}
-    memtable_dirty_memory_manager() : dirty_memory_manager(nullptr, std::numeric_limits<size_t>::max(), 4) {}
-};
-
-extern thread_local memtable_dirty_memory_manager default_dirty_memory_manager;
+extern thread_local dirty_memory_manager default_dirty_memory_manager;
 
 // We could just add all memtables, regardless of types, to a single list, and
 // then filter them out when we read them. Here's why I have chosen not to do
@@ -217,16 +290,27 @@ private:
     std::vector<shared_memtable> _memtables;
     std::function<future<> (flush_behavior)> _seal_fn;
     std::function<schema_ptr()> _current_schema;
-    size_t _max_memtable_size;
     dirty_memory_manager* _dirty_memory_manager;
+    std::experimental::optional<shared_promise<>> _flush_coalescing;
 public:
-    memtable_list(std::function<future<> (flush_behavior)> seal_fn, std::function<schema_ptr()> cs, size_t max_memtable_size, dirty_memory_manager* dirty_memory_manager)
+    memtable_list(std::function<future<> (flush_behavior)> seal_fn, std::function<schema_ptr()> cs, dirty_memory_manager* dirty_memory_manager)
         : _memtables({})
         , _seal_fn(seal_fn)
         , _current_schema(cs)
-        , _max_memtable_size(max_memtable_size)
         , _dirty_memory_manager(dirty_memory_manager) {
         add_memtable();
+    }
+
+    memtable_list(std::function<schema_ptr()> cs, dirty_memory_manager* dirty_memory_manager)
+        : _memtables({})
+        , _seal_fn()
+        , _current_schema(cs)
+        , _dirty_memory_manager(dirty_memory_manager) {
+        add_memtable();
+    }
+
+    bool may_flush() const {
+        return bool(_seal_fn);
     }
 
     shared_memtable back() {
@@ -273,21 +357,16 @@ public:
         _memtables.emplace_back(new_memtable());
     }
 
-    bool should_flush() {
-        return active_memtable().occupancy().total_space() >= _max_memtable_size;
+    logalloc::region_group& region_group() {
+        return _dirty_memory_manager->region_group();
     }
-
-    void seal_on_overflow() {
-        if (should_flush()) {
-            // FIXME: if sparse, do some in-memory compaction first
-            // FIXME: maybe merge with other in-memory memtables
-            seal_active_memtable(flush_behavior::immediate);
-        }
-    }
+    // This is used for explicit flushes. Will queue the memtable for flushing and proceed when the
+    // dirty_memory_manager allows us to. We will not seal at this time since the flush itself
+    // wouldn't happen anyway. Keeping the memtable in memory will potentially increase the time it
+    // spends in memory allowing for more coalescing opportunities.
+    future<> request_flush();
 private:
-    lw_shared_ptr<memtable> new_memtable() {
-        return make_lw_shared<memtable>(_current_schema(), &(_dirty_memory_manager->region_group()));
-    }
+    lw_shared_ptr<memtable> new_memtable();
 };
 
 using sstable_list = sstables::sstable_list;
@@ -320,11 +399,10 @@ public:
         bool enable_cache = true;
         bool enable_commitlog = true;
         bool enable_incremental_backups = false;
-        size_t max_memtable_size = 5'000'000;
-        size_t max_streaming_memtable_size = 5'000'000;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
         restricted_mutation_reader_config read_concurrency_config;
+        restricted_mutation_reader_config streaming_read_concurrency_config;
         ::cf_stats* cf_stats = nullptr;
         uint64_t max_cached_partition_size_in_bytes;
     };
@@ -357,6 +435,11 @@ private:
     config _config;
     mutable stats _stats;
 
+    uint64_t _failed_counter_applies_to_memtable = 0;
+
+    template<typename... Args>
+    void do_apply(Args&&... args);
+
     lw_shared_ptr<memtable_list> _memtables;
 
     // In older incarnations, we simply commited the mutations to memtables.
@@ -378,9 +461,6 @@ private:
     // server.
     lw_shared_ptr<memtable_list> _streaming_memtables;
     utils::phased_barrier _streaming_flush_phaser;
-
-    friend class memtable_dirty_memory_manager;
-    friend class streaming_dirty_memory_manager;
 
     // If mutations are fragmented during streaming the sstables cannot be made
     // visible immediately after memtable flush, because that could cause
@@ -412,6 +492,11 @@ private:
     // have not been deleted yet, so must not GC any tombstones in other sstables
     // that may delete data in these sstables:
     std::vector<sstables::shared_sstable> _sstables_compacted_but_not_deleted;
+    // sstables that have been opened but not loaded yet, that's because refresh
+    // needs to load all opened sstables atomically, and now, we open a sstable
+    // in all shards at the same time, which makes it hard to store all sstables
+    // we need to load later on for all shards.
+    std::vector<sstables::shared_sstable> _sstables_opened_but_not_loaded;
     // sstables that are shared between several shards so we want to rewrite
     // them (split the data belonging to this shard to a separate sstable),
     // but for correct compaction we need to start the compaction only after
@@ -440,15 +525,25 @@ private:
     // Last but not least, we seldom need to guarantee any ordering here: as long
     // as all data is waited for, we're good.
     seastar::gate _streaming_flush_gate;
+    std::unordered_map<sstring, db::view::view> _views;
+    std::vector<view_ptr> _view_schemas;
+    semaphore _cache_update_sem{1};
+
+    std::unique_ptr<cell_locker> _counter_cell_locks;
 private:
-    void update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable);
-    void add_sstable(sstables::sstable&& sstable);
-    void add_sstable(lw_shared_ptr<sstables::sstable> sstable);
-    future<> load_sstable(sstables::sstable&& sstab, bool reset_level = false);
+    void update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, std::vector<unsigned>&& shards_for_the_sstable);
+    // Adds new sstable to the set of sstables
+    // Doesn't update the cache.
+    // Doesn't trigger compaction.
+    void add_sstable(lw_shared_ptr<sstables::sstable> sstable, std::vector<unsigned>&& shards_for_the_sstable);
+    // returns an empty pointer if sstable doesn't belong to current shard.
+    future<lw_shared_ptr<sstables::sstable>> open_sstable(sstables::foreign_sstable_open_info info, sstring dir,
+        int64_t generation, sstables::sstable::version_types v, sstables::sstable::format_types f);
+    void load_sstable(lw_shared_ptr<sstables::sstable>& sstable, bool reset_level = false);
     lw_shared_ptr<memtable> new_memtable();
     lw_shared_ptr<memtable> new_streaming_memtable();
     future<stop_iteration> try_flush_memtable_to_sstable(lw_shared_ptr<memtable> memt);
-    future<> update_cache(memtable&, sstables::shared_sstable exclude_sstable);
+    future<> update_cache(memtable&, lw_shared_ptr<sstables::sstable_set> old_sstables);
     struct merge_comparator;
 
     // update the sstable generation, making sure that new new sstables don't overwrite this one.
@@ -466,27 +561,37 @@ private:
         return (*_sstable_generation)++ * smp::count + engine().cpu_id();
     }
 
+    // inverse of calculate_generation_for_new_table(), used to determine which
+    // shard a sstable should be opened at.
+    static int64_t calculate_shard_from_sstable_generation(int64_t sstable_generation) {
+        return sstable_generation % smp::count;
+    }
+
     // Rebuild existing _sstables with new_sstables added to it and sstables_to_remove removed from it.
     void rebuild_sstable_list(const std::vector<sstables::shared_sstable>& new_sstables,
                               const std::vector<sstables::shared_sstable>& sstables_to_remove);
     void rebuild_statistics();
 private:
+    using virtual_reader_type = std::function<mutation_reader(schema_ptr, const dht::partition_range&, const query::partition_slice&, const io_priority_class&, tracing::trace_state_ptr)>;
+    virtual_reader_type _virtual_reader;
     // Creates a mutation reader which covers sstables.
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
     mutation_reader make_sstable_reader(schema_ptr schema,
-                                        const query::partition_range& range,
+                                        const dht::partition_range& range,
                                         const query::partition_slice& slice,
                                         const io_priority_class& pc,
                                         tracing::trace_state_ptr trace_state) const;
 
     mutation_source sstables_as_mutation_source();
-    key_source sstables_as_key_source() const;
-    partition_presence_checker make_partition_presence_checker(sstables::shared_sstable exclude_sstable);
+    partition_presence_checker make_partition_presence_checker(lw_shared_ptr<sstables::sstable_set>);
     std::chrono::steady_clock::time_point _sstable_writes_disabled_at;
     void do_trigger_compaction();
 public:
+    uint64_t failed_counter_applies_to_memtable() const {
+        return _failed_counter_applies_to_memtable;
+    }
 
     // This function should be called when this column family is ready for writes, IOW,
     // to produce SSTables. Extensive details about why this is important can be found
@@ -516,7 +621,7 @@ public:
     // If I/O needs to be issued to read anything in the specified range, the operations
     // will be scheduled under the priority class given by pc.
     mutation_reader make_reader(schema_ptr schema,
-            const query::partition_range& range = query::full_partition_range,
+            const dht::partition_range& range = query::full_partition_range,
             const query::partition_slice& slice = query::full_slice,
             const io_priority_class& pc = default_priority_class(),
             tracing::trace_state_ptr trace_state = nullptr) const;
@@ -526,9 +631,17 @@ public:
     //    reader and a _bounded_ amount of writes which arrive later.
     //  - Does not populate the cache
     mutation_reader make_streaming_reader(schema_ptr schema,
-            const query::partition_range& range = query::full_partition_range) const;
+            const dht::partition_range& range = query::full_partition_range) const;
+
+    // Requires ranges to be sorted and disjoint.
+    mutation_reader make_streaming_reader(schema_ptr schema,
+            const dht::partition_range_vector& ranges) const;
 
     mutation_source as_mutation_source(tracing::trace_state_ptr trace_state) const;
+
+    void set_virtual_reader(virtual_reader_type virtual_reader) {
+        _virtual_reader = std::move(virtual_reader);
+    }
 
     // Queries can be satisfied from multiple data sources, so they are returned
     // as temporaries.
@@ -544,6 +657,8 @@ public:
     row_cache& get_row_cache() {
         return _cache;
     }
+
+    future<std::vector<locked_cell>> lock_counter_cells(const mutation& m);
 
     logalloc::occupancy_stats occupancy() const;
 private:
@@ -570,16 +685,16 @@ public:
     // Returns at most "cmd.limit" rows
     future<lw_shared_ptr<query::result>> query(schema_ptr,
         const query::read_command& cmd, query::result_request request,
-        const std::vector<query::partition_range>& ranges,
-        tracing::trace_state_ptr trace_state);
-
-    future<> populate(sstring datadir);
+        const dht::partition_range_vector& ranges,
+        tracing::trace_state_ptr trace_state,
+        query::result_memory_limiter& memory_limiter,
+        uint64_t max_result_size);
 
     void start();
     future<> stop();
     future<> flush();
     future<> flush(const db::replay_position&);
-    future<> flush_streaming_mutations(utils::UUID plan_id, std::vector<query::partition_range> ranges = std::vector<query::partition_range>{});
+    future<> flush_streaming_mutations(utils::UUID plan_id, dht::partition_range_vector ranges = dht::partition_range_vector{});
     future<> fail_streaming_mutations(utils::UUID plan_id);
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
@@ -611,17 +726,6 @@ public:
         _sstables_lock.write_unlock();
         return std::chrono::steady_clock::now() - _sstable_writes_disabled_at;
     }
-
-    // This function will iterate through upload directory in column family,
-    // and will do the following for each sstable found:
-    // 1) Mutate sstable level to 0.
-    // 2) Create hard links to its components in column family dir.
-    // 3) Remove all of its components in upload directory.
-    // At the end, it's expected that upload dir is empty and all of its
-    // previous content was moved to column family dir.
-    //
-    // Return a vector containing descriptor of sstables to be loaded.
-    future<std::vector<sstables::entry_descriptor>> flush_upload_dir();
 
     // Make sure the generation numbers are sequential, starting from "start".
     // Generations before "start" are left untouched.
@@ -656,7 +760,6 @@ public:
 
     future<bool> snapshot_exists(sstring name);
 
-    future<> load_new_sstables(std::vector<sstables::entry_descriptor> new_tables);
     future<> snapshot(sstring name);
     future<> clear_snapshot(sstring name);
     future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
@@ -669,9 +772,11 @@ public:
         _config.enable_incremental_backups = val;
     }
 
+    const sstables::sstable_set& get_sstable_set() const;
     lw_shared_ptr<sstable_list> get_sstables() const;
     lw_shared_ptr<sstable_list> get_sstables_including_compacted_undeleted() const;
-    std::vector<sstables::shared_sstable> select_sstables(const query::partition_range& range) const;
+    const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const;
+    std::vector<sstables::shared_sstable> select_sstables(const dht::partition_range& range) const;
     size_t sstables_count() const;
     std::vector<uint64_t> sstable_count_per_level() const;
     int64_t get_unleveled_sstables() const;
@@ -711,7 +816,13 @@ public:
             }
         });
     }
+
+    void add_or_update_view(view_ptr v);
+    void remove_view(view_ptr v);
+    const std::vector<view_ptr>& views() const;
 private:
+    void update_view_schemas();
+
     // One does not need to wait on this future if all we are interested in, is
     // initiating the write.  The writes initiated here will eventually
     // complete, and the seastar::gate below will make sure they are all
@@ -743,7 +854,7 @@ private:
     // repair can now choose whatever strategy - small or big ranges - it wants, resting assure
     // that the incoming memtables will be coalesced together.
     shared_promise<> _waiting_streaming_flushes;
-    timer<> _delayed_streaming_flush{[this] { seal_active_streaming_memtable_immediate(); }};
+    timer<> _delayed_streaming_flush{[this] { _streaming_memtables->request_flush(); }};
     future<> seal_active_streaming_memtable_delayed();
     future<> seal_active_streaming_memtable_immediate();
     future<> seal_active_streaming_memtable(memtable_list::flush_behavior behavior) {
@@ -765,7 +876,6 @@ private:
     // Func signature: bool (const decorated_key& dk, const mutation_partition& mp)
     template <typename Func>
     future<bool> for_all_partitions(schema_ptr, Func&& func) const;
-    future<sstables::entry_descriptor> probe_file(sstring sstdir, sstring fname);
     void check_valid_rp(const db::replay_position&) const;
 public:
     void start_rewrite();
@@ -776,6 +886,8 @@ public:
     friend std::ostream& operator<<(std::ostream& out, const column_family& cf);
     // Testing purposes.
     friend class column_family_test;
+
+    friend class distributed_loader;
 };
 
 class user_types_metadata {
@@ -862,6 +974,8 @@ public:
     void remove_user_type(const user_type ut) {
         _user_types->remove_type(ut);
     }
+    std::vector<schema_ptr> tables() const;
+    std::vector<view_ptr> views() const;
     friend std::ostream& operator<<(std::ostream& os, const keyspace_metadata& m);
 };
 
@@ -874,11 +988,10 @@ public:
         bool enable_disk_writes = true;
         bool enable_cache = true;
         bool enable_incremental_backups = false;
-        size_t max_memtable_size = 5'000'000;
-        size_t max_streaming_memtable_size = 5'000'000;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
         restricted_mutation_reader_config read_concurrency_config;
+        restricted_mutation_reader_config streaming_read_concurrency_config;
         ::cf_stats* cf_stats = nullptr;
     };
 private:
@@ -957,23 +1070,32 @@ public:
 //   use shard_of() for data
 
 class database {
+public:
+    using timeout_clock = lowres_clock;
+private:
     ::cf_stats _cf_stats;
     static constexpr size_t max_concurrent_reads() { return 100; }
     static constexpr size_t max_system_concurrent_reads() { return 10; }
     struct db_stats {
         uint64_t total_writes = 0;
+        uint64_t total_writes_failed = 0;
+        uint64_t total_writes_timedout = 0;
         uint64_t total_reads = 0;
+        uint64_t total_reads_failed = 0;
         uint64_t sstable_read_queue_overloaded = 0;
+
+        uint64_t short_data_queries = 0;
+        uint64_t short_mutation_queries = 0;
     };
 
     lw_shared_ptr<db_stats> _stats;
 
     std::unique_ptr<db::config> _cfg;
-    size_t _memtable_total_space = 500 << 20;
-    size_t _streaming_memtable_total_space = 500 << 20;
-    memtable_dirty_memory_manager _system_dirty_memory_manager;
-    memtable_dirty_memory_manager _dirty_memory_manager;
-    streaming_dirty_memory_manager _streaming_dirty_memory_manager;
+
+    dirty_memory_manager _system_dirty_memory_manager;
+    dirty_memory_manager _dirty_memory_manager;
+    dirty_memory_manager _streaming_dirty_memory_manager;
+
     semaphore _read_concurrency_sem{max_concurrent_reads()};
     restricted_mutation_reader_config _read_concurrency_config;
     semaphore _system_read_concurrency_sem{max_system_concurrent_reads()};
@@ -986,13 +1108,11 @@ class database {
     utils::UUID _version;
     // compaction_manager object is referenced by all column families of a database.
     compaction_manager _compaction_manager;
-    std::vector<scollectd::registration> _collectd;
+    seastar::metrics::metric_groups _metrics;
     bool _enable_incremental_backups = false;
 
     future<> init_commitlog();
-    future<> apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::replay_position);
-    future<> populate(sstring datadir);
-    future<> populate_keyspace(sstring datadir, sstring ks_name);
+    future<> apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::replay_position, timeout_clock::time_point timeout);
 
 private:
     // Unless you are an earlier boostraper or the database itself, you should
@@ -1000,11 +1120,19 @@ private:
     void add_keyspace(sstring name, keyspace k);
     void create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
     friend void db::system_keyspace::make(database& db, bool durable, bool volatile_testing_only);
-    void setup_collectd();
+    void setup_metrics();
 
-    future<> do_apply(schema_ptr, const frozen_mutation&);
+    future<> do_apply(schema_ptr, const frozen_mutation&, timeout_clock::time_point timeout);
+
+    query::result_memory_limiter _result_memory_limiter;
+
+    future<frozen_mutation> do_apply_counter_update(column_family& cf, const frozen_mutation& fm, schema_ptr m_schema);
 public:
     static utils::UUID empty_version;
+
+    query::result_memory_limiter& get_result_memory_limiter() {
+        return _result_memory_limiter;
+    }
 
     void set_enable_incremental_backups(bool val) { _enable_incremental_backups = val; }
 
@@ -1029,10 +1157,8 @@ public:
         return _compaction_manager;
     }
 
-    future<> init_system_keyspace();
-    future<> load_sstables(distributed<service::storage_proxy>& p); // after init_system_keyspace()
-
-    void add_column_family(schema_ptr schema, column_family::config cfg);
+    void add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg);
+    future<> add_column_family_and_make_directory(schema_ptr schema);
 
     /* throws std::out_of_range if missing */
     const utils::UUID& find_uuid(const sstring& ks, const sstring& cf) const;
@@ -1067,10 +1193,15 @@ public:
     unsigned shard_of(const dht::token& t);
     unsigned shard_of(const mutation& m);
     unsigned shard_of(const frozen_mutation& m);
-    future<lw_shared_ptr<query::result>> query(schema_ptr, const query::read_command& cmd, query::result_request request, const std::vector<query::partition_range>& ranges, tracing::trace_state_ptr trace_state);
-    future<reconcilable_result> query_mutations(schema_ptr, const query::read_command& cmd, const query::partition_range& range, tracing::trace_state_ptr trace_state);
-    future<> apply(schema_ptr, const frozen_mutation&);
+    future<lw_shared_ptr<query::result>> query(schema_ptr, const query::read_command& cmd, query::result_request request, const dht::partition_range_vector& ranges,
+                                               tracing::trace_state_ptr trace_state, uint64_t max_result_size);
+    future<reconcilable_result> query_mutations(schema_ptr, const query::read_command& cmd, const dht::partition_range& range,
+                                                query::result_memory_accounter&& accounter, tracing::trace_state_ptr trace_state);
+    // Apply the mutation atomically.
+    // Throws timed_out_error when timeout is reached.
+    future<> apply(schema_ptr, const frozen_mutation&, timeout_clock::time_point timeout = timeout_clock::time_point::max());
     future<> apply_streaming_mutation(schema_ptr, utils::UUID plan_id, const frozen_mutation&, bool fragmented);
+    future<frozen_mutation> apply_counter_update(schema_ptr, const frozen_mutation& m, timeout_clock::time_point timeout = timeout_clock::time_point::max());
     keyspace::config make_keyspace_config(const keyspace_metadata& ksm);
     const sstring& get_snitch_name() const;
     future<> clear_snapshot(sstring tag, std::vector<sstring> keyspace_names);
@@ -1113,6 +1244,7 @@ public:
     future<> truncate(sstring ksname, sstring cfname, timestamp_func);
     future<> truncate(const keyspace& ks, column_family& cf, timestamp_func);
 
+    bool update_column_family(schema_ptr s);
     future<> drop_column_family(const sstring& ks_name, const sstring& cf_name, timestamp_func);
 
     const logalloc::region_group& dirty_memory_region_group() const {
@@ -1125,11 +1257,26 @@ public:
     semaphore& system_keyspace_read_concurrency_sem() {
         return _system_read_concurrency_sem;
     }
+
+    friend class distributed_loader;
 };
 
 // FIXME: stub
 class secondary_index_manager {};
 
 future<> update_schema_version_and_announce(distributed<service::storage_proxy>& proxy);
+
+class distributed_loader {
+public:
+    static future<> open_sstable(distributed<database>& db, sstables::entry_descriptor comps,
+        std::function<future<> (column_family&, sstables::foreign_sstable_open_info)> func);
+    static future<> load_new_sstables(distributed<database>& db, sstring ks, sstring cf, std::vector<sstables::entry_descriptor> new_tables);
+    static future<std::vector<sstables::entry_descriptor>> flush_upload_dir(distributed<database>& db, sstring ks_name, sstring cf_name);
+    static future<sstables::entry_descriptor> probe_file(distributed<database>& db, sstring sstdir, sstring fname);
+    static future<> populate_column_family(distributed<database>& db, sstring sstdir, sstring ks, sstring cf);
+    static future<> populate_keyspace(distributed<database>& db, sstring datadir, sstring ks_name);
+    static future<> init_system_keyspace(distributed<database>& db);
+    static future<> init_non_system_keyspaces(distributed<database>& db, distributed<service::storage_proxy>& proxy);
+};
 
 #endif /* DATABASE_HH_ */

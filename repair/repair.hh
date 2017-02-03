@@ -107,4 +107,15 @@ public:
 // not resolved.
 future<partition_checksum> checksum_range(seastar::sharded<database> &db,
         const sstring& keyspace, const sstring& cf,
-        const ::range<dht::token>& range, repair_checksum rt);
+        const ::dht::token_range& range, repair_checksum rt);
+
+namespace std {
+template<>
+struct hash<partition_checksum> {
+    size_t operator()(partition_checksum sum) const {
+        size_t h = 0;
+        std::copy_n(sum.digest().begin(), std::min(sizeof(size_t), sizeof(sum.digest())), reinterpret_cast<uint8_t*>(&h));
+        return h;
+    }
+};
+}

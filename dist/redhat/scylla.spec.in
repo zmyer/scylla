@@ -27,10 +27,11 @@ Group:          Applications/Databases
 Summary:        The Scylla database server
 License:        AGPLv3
 URL:            http://www.scylladb.com/
-BuildRequires:  libaio-devel libstdc++-devel cryptopp-devel hwloc-devel numactl-devel libpciaccess-devel libxml2-devel zlib-devel thrift-devel yaml-cpp-devel lz4-devel snappy-devel jsoncpp-devel systemd-devel xz-devel openssl-devel libcap-devel libselinux-devel libgcrypt-devel libgpg-error-devel elfutils-devel krb5-devel libcom_err-devel libattr-devel pcre-devel elfutils-libelf-devel bzip2-devel keyutils-libs-devel xfsprogs-devel make gnutls-devel systemd-devel lksctp-tools-devel protobuf-devel protobuf-compiler libunwind-devel
+BuildRequires:  libaio-devel libstdc++-devel cryptopp-devel hwloc-devel numactl-devel libpciaccess-devel libxml2-devel zlib-devel thrift-devel yaml-cpp-devel lz4-devel snappy-devel jsoncpp-devel systemd-devel xz-devel pcre-devel elfutils-libelf-devel bzip2-devel keyutils-libs-devel xfsprogs-devel make gnutls-devel systemd-devel lksctp-tools-devel protobuf-devel protobuf-compiler libunwind-devel systemtap-sdt-devel
 %{?fedora:BuildRequires: boost-devel ninja-build ragel antlr3-tool antlr3-C++-devel python3 gcc-c++ libasan libubsan python3-pyparsing dnf-yum}
-%{?rhel:BuildRequires: scylla-libstdc++-static scylla-boost-devel scylla-ninja-build scylla-ragel scylla-antlr3-tool scylla-antlr3-C++-devel python34 scylla-gcc-c++ >= 5.1.1, python34-pyparsing}
-Requires:       scylla-conf systemd-libs hwloc collectd PyYAML python-urwid pciutils pyparsing python-requests curl bc util-linux
+%{?rhel:BuildRequires: scylla-libstdc++-static scylla-boost-devel scylla-boost-static scylla-ninja-build scylla-ragel scylla-antlr3-tool scylla-antlr3-C++-devel python34 scylla-gcc-c++ >= 5.1.1, python34-pyparsing}
+Requires:       scylla-conf systemd-libs hwloc collectd PyYAML python-urwid pciutils pyparsing python-requests curl util-linux python-setuptools pciutils
+%{?rhel:Requires: python34 python34-PyYAML}
 Conflicts:      abrt
 
 %description server
@@ -47,7 +48,7 @@ This package contains ScyllaDB server.
 ./configure.py --disable-xen --enable-dpdk --mode=release
 %endif
 %if 0%{?rhel}
-python3.4 ./configure.py --disable-xen --enable-dpdk --mode=release --static-stdc++ --compiler=/opt/scylladb/bin/g++ --python python3.4
+python3.4 ./configure.py --disable-xen --enable-dpdk --mode=release --static-stdc++ --static-boost --compiler=/opt/scylladb/bin/g++ --python python3.4
 %endif
 ninja-build %{?_smp_mflags} build/release/scylla build/release/iotune
 cp dist/common/systemd/scylla-server.service.in build/scylla-server.service
@@ -80,13 +81,14 @@ install -m644 dist/common/systemd/*.service  $RPM_BUILD_ROOT%{_unitdir}/
 install -m644 dist/common/systemd/*.timer $RPM_BUILD_ROOT%{_unitdir}/
 install -m755 dist/common/scripts/* $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
 install -m755 seastar/scripts/posix_net_conf.sh  $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
-install -m755 seastar/dpdk/tools/dpdk_nic_bind.py $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
+install -m755 seastar/dpdk/tools/dpdk-devbind.py $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
 install -m755 build/release/scylla $RPM_BUILD_ROOT%{_bindir}
 install -m755 build/release/iotune $RPM_BUILD_ROOT%{_bindir}
 install -m755 dist/common/bin/scyllatop $RPM_BUILD_ROOT%{_bindir}
+install -m755 scylla-blocktune $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
 install -m755 scylla-housekeeping $RPM_BUILD_ROOT%{_prefix}/lib/scylla/
 if @@HOUSEKEEPING_CONF@@; then
-    install -m644 conf/housekeeping.cfg $RPM_BUILD_ROOT%{_sysconfdir}/scylla/
+    install -m644 conf/housekeeping.cfg $RPM_BUILD_ROOT%{_sysconfdir}/scylla.d/
 fi
 install -d -m755 $RPM_BUILD_ROOT%{_docdir}/scylla
 install -m644 README.md $RPM_BUILD_ROOT%{_docdir}/scylla/
@@ -99,6 +101,7 @@ install -d -m755 $RPM_BUILD_ROOT%{_sharedstatedir}/scylla/
 install -d -m755 $RPM_BUILD_ROOT%{_sharedstatedir}/scylla/data
 install -d -m755 $RPM_BUILD_ROOT%{_sharedstatedir}/scylla/commitlog
 install -d -m755 $RPM_BUILD_ROOT%{_sharedstatedir}/scylla/coredump
+install -d -m755 $RPM_BUILD_ROOT%{_sharedstatedir}/scylla-housekeeping
 install -d -m755 $RPM_BUILD_ROOT%{_prefix}/lib/scylla/swagger-ui
 cp -r swagger-ui/dist $RPM_BUILD_ROOT%{_prefix}/lib/scylla/swagger-ui
 install -d -m755 $RPM_BUILD_ROOT%{_prefix}/lib/scylla/api
@@ -108,8 +111,8 @@ cp -r scylla-housekeeping $RPM_BUILD_ROOT%{_prefix}/lib/scylla/scylla-housekeepi
 cp -P dist/common/sbin/*  $RPM_BUILD_ROOT%{_sbindir}/
 
 %pre server
-/usr/sbin/groupadd scylla 2> /dev/null || :
-/usr/sbin/useradd -g scylla -s /sbin/nologin -r -d %{_sharedstatedir}/scylla scylla 2> /dev/null || :
+getent group scylla || /usr/sbin/groupadd scylla 2> /dev/null || :
+getent passwd scylla || /usr/sbin/useradd -g scylla -s /sbin/nologin -r -d %{_sharedstatedir}/scylla scylla 2> /dev/null || :
 
 %post server
 # Upgrade coredump settings
@@ -156,6 +159,7 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/iotune
 %{_bindir}/scyllatop
 %{_sbindir}/scylla*
+%{_prefix}/lib/scylla/scylla-blocktune
 %{_prefix}/lib/scylla/scylla-housekeeping
 %{_prefix}/lib/scylla/scylla_prepare
 %{_prefix}/lib/scylla/scylla_stop
@@ -172,20 +176,26 @@ rm -rf $RPM_BUILD_ROOT
 %{_prefix}/lib/scylla/scylla_dev_mode_setup
 %{_prefix}/lib/scylla/scylla_kernel_check
 %{_prefix}/lib/scylla/scylla_cpuset_setup
+%{_prefix}/lib/scylla/scylla_cpuscaling_setup
 %{_prefix}/lib/scylla/posix_net_conf.sh
-%{_prefix}/lib/scylla/dpdk_nic_bind.py
-%{_prefix}/lib/scylla/dpdk_nic_bind.pyc
-%{_prefix}/lib/scylla/dpdk_nic_bind.pyo
+%{_prefix}/lib/scylla/dpdk-devbind.py
+%{_prefix}/lib/scylla/dpdk-devbind.pyc
+%{_prefix}/lib/scylla/dpdk-devbind.pyo
+%{_prefix}/lib/scylla/hex2list.py
+%{_prefix}/lib/scylla/hex2list.pyc
+%{_prefix}/lib/scylla/hex2list.pyo
 %{_prefix}/lib/scylla/swagger-ui/dist/*
 %{_prefix}/lib/scylla/api/api-doc/*
 %{_prefix}/lib/scylla/scyllatop/*
 %{_prefix}/lib/scylla/scylla_config_get.py
 %{_prefix}/lib/scylla/scylla_config_get.pyc
 %{_prefix}/lib/scylla/scylla_config_get.pyo
+%{_prefix}/lib/scylla/scylla_lib.sh
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/data
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/commitlog
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/coredump
+%attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla-housekeeping
 
 %package conf
 Group:          Applications/Databases
@@ -209,7 +219,7 @@ mv /tmp/scylla.yaml /etc/scylla/scylla.yaml
 %config(noreplace) %{_sysconfdir}/scylla/scylla.yaml
 %config(noreplace) %{_sysconfdir}/scylla/cassandra-rackdc.properties
 %if %is_housekeeping_conf
-%config(noreplace) %{_sysconfdir}/scylla/housekeeping.cfg
+%config(noreplace) %{_sysconfdir}/scylla.d/housekeeping.cfg
 %endif
 
 

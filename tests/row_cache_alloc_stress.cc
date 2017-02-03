@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
             auto mt0 = make_lw_shared<memtable>(s);
 
             cache_tracker tracker;
-            row_cache cache(s, mt0->as_data_source(), mt0->as_key_source(), tracker);
+            row_cache cache(s, mt0->as_data_source(), tracker);
 
             auto mt = make_lw_shared<memtable>(s);
             std::vector<dht::decorated_key> keys;
@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
             // When this assertion fails, increase amount of memory
             assert(mt->occupancy().used_space() < reclaimable_memory());
 
-            auto checker = [](const partition_key& key) {
+            auto checker = [](auto) {
                 return partition_presence_checker_result::maybe_exists;
             };
 
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
 
             // Verify that all mutations from memtable went through
             for (auto&& key : keys) {
-                auto range = query::partition_range::make_singular(key);
+                auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, range);
                 auto mo = mutation_from_streamed_mutation(reader().get0()).get0();
                 assert(mo);
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
             }
 
             for (auto&& key : keys) {
-                auto range = query::partition_range::make_singular(key);
+                auto range = dht::partition_range::make_singular(key);
                 auto reader = cache.make_reader(s, range);
                 auto mo = reader().get0();
                 assert(mo);
@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
                 }
 
                 const mutation& m = make_large_mutation();
-                auto range = query::partition_range::make_singular(m.decorated_key());
+                auto range = dht::partition_range::make_singular(m.decorated_key());
 
                 cache.populate(m);
 

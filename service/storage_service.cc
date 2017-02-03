@@ -69,6 +69,8 @@
 #include "auth/auth.hh"
 #include <seastar/net/tls.hh>
 #include "utils/exceptions.hh"
+#include "message/messaging_service.hh"
+#include "supervisor.hh"
 
 using token = dht::token;
 using UUID = utils::UUID;
@@ -80,6 +82,8 @@ static logging::logger logger("storage_service");
 
 static const sstring RANGE_TOMBSTONES_FEATURE = "RANGE_TOMBSTONES";
 static const sstring LARGE_PARTITIONS_FEATURE = "LARGE_PARTITIONS";
+static const sstring MATERIALIZED_VIEWS_FEATURE = "MATERIALIZED_VIEWS";
+static const sstring COUNTERS_FEATURE = "COUNTERS";
 
 distributed<storage_service> _the_storage_service;
 
@@ -88,6 +92,24 @@ int get_generation_number() {
     auto now = high_resolution_clock::now().time_since_epoch();
     int generation_number = duration_cast<seconds>(now).count();
     return generation_number;
+}
+
+storage_service::storage_service(distributed<database>& db)
+        : _db(db) {
+    sstable_read_error.connect([this] { isolate_on_error(); });
+    sstable_write_error.connect([this] { isolate_on_error(); });
+    general_disk_error.connect([this] { isolate_on_error(); });
+    commit_error.connect([this] { isolate_on_commit_error(); });
+}
+
+void
+storage_service::isolate_on_error() {
+    do_isolate_on_error(disk_error::regular);
+}
+
+void
+storage_service::isolate_on_commit_error() {
+    do_isolate_on_error(disk_error::commit);
 }
 
 bool storage_service::is_auto_bootstrap() {
@@ -102,6 +124,10 @@ sstring storage_service::get_config_supported_features() {
         RANGE_TOMBSTONES_FEATURE,
         LARGE_PARTITIONS_FEATURE,
     };
+    if (service::get_local_storage_service()._db.local().get_config().experimental()) {
+        features.push_back(MATERIALIZED_VIEWS_FEATURE);
+        features.push_back(COUNTERS_FEATURE);
+    }
     return join(",", features);
 }
 
@@ -261,6 +287,9 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
     // (we won't be part of the storage ring though until we add a counterId to our state, below.)
     // Seed the host ID-to-endpoint map with our own ID.
     auto local_host_id = db::system_keyspace::get_local_host_id().get0();
+    get_storage_service().invoke_on_all([local_host_id] (auto& ss) {
+        ss._local_host_id = local_host_id;
+    }).get();
     auto features = get_config_supported_features();
     _token_metadata.update_host_id(local_host_id, get_broadcast_address());
     auto broadcast_rpc_address = utils::fb_utilities::get_broadcast_rpc_address();
@@ -294,7 +323,11 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
 
 // Runs inside seastar::async context
 void storage_service::join_token_ring(int delay) {
-    _joined = true;
+    // This function only gets called on shard 0, but we want to set _joined
+    // on all shards, so this variable can be later read locally.
+    get_storage_service().invoke_on_all([] (auto&& ss) {
+        ss._joined = true;
+    }).get();
     // We bootstrap if we haven't successfully bootstrapped before, as long as we are not a seed.
     // If we are a seed, or if the user manually sets auto_bootstrap to false,
     // we'll skip streaming data from other nodes and jump directly into the ring.
@@ -443,6 +476,16 @@ void storage_service::join_token_ring(int delay) {
 #endif
 
     if (!_is_survey_mode) {
+        // We have to create the system_auth and system_traces keyspaces and
+        // their tables before Node moves to the NORMAL state so that other
+        // Nodes joining the newly created cluster and serializing on this event
+        // "see" these new objects and don't try to create them.
+        //
+        // Otherwise there is a high chance to hit the issue #420.
+        auth::auth::setup().get();
+        supervisor::notify("starting tracing");
+        tracing::tracing::start_tracing().get();
+
         // start participating in the ring.
         db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::COMPLETED).get();
         set_tokens(_bootstrap_tokens);
@@ -458,8 +501,6 @@ void storage_service::join_token_ring(int delay) {
             logger.error(err.c_str());
             throw std::runtime_error(err);
         }
-
-        auth::auth::setup().get();
     } else {
         logger.info("Startup complete, but write survey mode is active, not becoming an active ring member. Use JMX (StorageService->joinRing()) to finalize ring joining.");
     }
@@ -488,12 +529,11 @@ future<> storage_service::join_ring() {
     });
 }
 
-future<bool> storage_service::is_joined() {
-    return run_with_no_api_lock([] (storage_service& ss) {
-        return ss._joined && !ss._is_survey_mode;
-    });
+bool storage_service::is_joined() {
+    // Every time we set _joined, we do it on all shards, so we can read its
+    // value locally.
+    return _joined && !_is_survey_mode;
 }
-
 
 // Runs inside seastar::async context
 void storage_service::bootstrap(std::unordered_set<token> tokens) {
@@ -523,6 +563,70 @@ void storage_service::bootstrap(std::unordered_set<token> tokens) {
     dht::boot_strapper bs(_db, get_broadcast_address(), tokens, _token_metadata);
     bs.bootstrap().get(); // handles token update
     logger.info("Bootstrap completed! for the tokens {}", tokens);
+}
+
+sstring
+storage_service::get_rpc_address(const inet_address& endpoint) const {
+    if (endpoint != get_broadcast_address()) {
+        auto v = gms::get_local_gossiper().get_endpoint_state_for_endpoint(endpoint)->get_application_state(gms::application_state::RPC_ADDRESS);
+        if (v) {
+            return v.value().value;
+        }
+    }
+    return boost::lexical_cast<std::string>(endpoint);
+}
+
+std::unordered_map<dht::token_range, std::vector<inet_address>>
+storage_service::get_range_to_address_map(const sstring& keyspace) const {
+    return get_range_to_address_map(keyspace, _token_metadata.sorted_tokens());
+}
+
+std::unordered_map<dht::token_range, std::vector<inet_address>>
+storage_service::get_range_to_address_map_in_local_dc(
+        const sstring& keyspace) const {
+    std::function<bool(const inet_address&)> filter =  [this](const inet_address& address) {
+        return is_local_dc(address);
+    };
+
+    auto orig_map = get_range_to_address_map(keyspace, get_tokens_in_local_dc());
+    std::unordered_map<dht::token_range, std::vector<inet_address>> filtered_map;
+    for (auto entry : orig_map) {
+        auto& addresses = filtered_map[entry.first];
+        addresses.reserve(entry.second.size());
+        std::copy_if(entry.second.begin(), entry.second.end(), std::back_inserter(addresses), filter);
+    }
+
+    return filtered_map;
+}
+
+std::vector<token>
+storage_service::get_tokens_in_local_dc() const {
+    std::vector<token> filtered_tokens;
+    for (auto token : _token_metadata.sorted_tokens()) {
+        auto endpoint = _token_metadata.get_endpoint(token);
+        if (is_local_dc(*endpoint))
+            filtered_tokens.push_back(token);
+    }
+    return filtered_tokens;
+}
+
+bool
+storage_service::is_local_dc(const inet_address& targetHost) const {
+    auto remote_dc = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_datacenter(targetHost);
+    auto local_dc = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_datacenter(get_broadcast_address());
+    return remote_dc == local_dc;
+}
+
+std::unordered_map<dht::token_range, std::vector<inet_address>>
+storage_service::get_range_to_address_map(const sstring& keyspace,
+        const std::vector<token>& sorted_tokens) const {
+    // some people just want to get a visual representation of things. Allow null and set it to the first
+    // non-system keyspace.
+    if (keyspace == "" && _db.local().get_non_system_keyspaces().empty()) {
+        throw std::runtime_error("No keyspace provided and no non system kespace exist");
+    }
+    const sstring& ks = (keyspace == "") ? _db.local().get_non_system_keyspaces()[0] : keyspace;
+    return construct_range_to_endpoint_map(ks, get_all_ranges(sorted_tokens));
 }
 
 void storage_service::handle_state_bootstrap(inet_address endpoint) {
@@ -1015,7 +1119,7 @@ void storage_service::set_tokens(std::unordered_set<token> tokens) {
     logger.debug("Setting tokens to {}", tokens);
     db::system_keyspace::update_tokens(tokens).get();
     _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
-    auto local_tokens = get_local_tokens();
+    auto local_tokens = get_local_tokens().get0();
     set_gossip_tokens(local_tokens);
     set_mode(mode::NORMAL, "node is now in normal status", true);
     replicate_to_all_cores().get();
@@ -1044,7 +1148,7 @@ future<> storage_service::stop_transport() {
         return seastar::async([&ss] {
             logger.info("Stop transport: starts");
 
-            gms::get_local_gossiper().stop_gossiping().get();
+            gms::stop_gossiping().get();
             logger.info("Stop transport: stop_gossiping done");
 
             ss.shutdown_client_servers().get();
@@ -1244,6 +1348,11 @@ future<> storage_service::init_server(int delay) {
         get_storage_service().invoke_on_all([] (auto& ss) {
             ss._range_tombstones_feature = gms::feature(RANGE_TOMBSTONES_FEATURE);
             ss._large_partitions_feature = gms::feature(LARGE_PARTITIONS_FEATURE);
+
+            if (ss._db.local().get_config().experimental()) {
+                ss._materialized_views_feature = gms::feature(MATERIALIZED_VIEWS_FEATURE);
+                ss._counters_feature = gms::feature(COUNTERS_FEATURE);
+            }
         }).get();
     });
 }
@@ -1544,16 +1653,16 @@ void storage_service::set_mode(mode m, sstring msg, bool log) {
     }
 }
 
-// Runs inside seastar::async context
-std::unordered_set<dht::token> storage_service::get_local_tokens() {
-    auto tokens = db::system_keyspace::get_saved_tokens().get0();
-    // should not be called before initServer sets this
-    if (tokens.empty()) {
-        auto err = sprint("get_local_tokens: tokens is empty");
-        logger.error(err.c_str());
-        throw std::runtime_error(err);
-    }
-    return tokens;
+future<std::unordered_set<dht::token>> storage_service::get_local_tokens() {
+    return db::system_keyspace::get_saved_tokens().then([] (auto&& tokens) {
+        // should not be called before initServer sets this
+        if (tokens.empty()) {
+            auto err = sprint("get_local_tokens: tokens is empty");
+            logger.error(err.c_str());
+            throw std::runtime_error(err);
+        }
+        return tokens;
+    });
 }
 
 sstring storage_service::get_release_version() {
@@ -1634,7 +1743,7 @@ future<> storage_service::start_gossiping() {
         return seastar::async([&ss] {
             if (!ss._initialized) {
                 logger.warn("Starting gossip by operator request");
-                ss.set_gossip_tokens(ss.get_local_tokens());
+                ss.set_gossip_tokens(ss.get_local_tokens().get0());
                 gms::get_local_gossiper().force_newer_generation();
                 gms::get_local_gossiper().start_gossiping(get_generation_number()).then([&ss] {
                     ss._initialized = true;
@@ -1648,7 +1757,7 @@ future<> storage_service::stop_gossiping() {
     return run_with_api_lock(sstring("stop_gossiping"), [] (storage_service& ss) {
         if (ss._initialized) {
             logger.warn("Stopping gossip by operator request");
-            return gms::get_local_gossiper().stop_gossiping().then([&ss] {
+            return gms::stop_gossiping().then([&ss] {
                 ss._initialized = false;
             });
         }
@@ -2005,7 +2114,7 @@ future<> storage_service::decommission() {
             }).get();
             logger.info("DECOMMISSIONING: stop batchlog_manager done");
 
-            gms::get_local_gossiper().stop_gossiping().get();
+            gms::stop_gossiping().get();
             logger.info("DECOMMISSIONING: stop_gossiping done");
             ss.do_stop_ms().get();
             logger.info("DECOMMISSIONING: stop messaging_service done");
@@ -2067,7 +2176,7 @@ future<> storage_service::removenode(sstring host_id_string) {
 
                 // get all ranges that change ownership (that is, a node needs
                 // to take responsibility for new range)
-                std::unordered_multimap<range<token>, inet_address> changed_ranges =
+                std::unordered_multimap<dht::token_range, inet_address> changed_ranges =
                     ss.get_changed_ranges_for_leaving(keyspace_name, endpoint);
                 auto& fd = gms::get_local_failure_detector();
                 for (auto& x: changed_ranges) {
@@ -2170,7 +2279,7 @@ future<> storage_service::drain() {
 
             ss.set_mode(mode::DRAINING, "starting drain process", true);
             ss.shutdown_client_servers().get();
-            gms::get_local_gossiper().stop_gossiping().get();
+            gms::stop_gossiping().get();
 
             ss.set_mode(mode::DRAINING, "shutting down messaging_service", false);
             ss.do_stop_ms().get();
@@ -2285,13 +2394,13 @@ future<bool> storage_service::is_initialized() {
     });
 }
 
-std::unordered_multimap<range<token>, inet_address> storage_service::get_changed_ranges_for_leaving(sstring keyspace_name, inet_address endpoint) {
+std::unordered_multimap<dht::token_range, inet_address> storage_service::get_changed_ranges_for_leaving(sstring keyspace_name, inet_address endpoint) {
     // First get all ranges the leaving endpoint is responsible for
     auto ranges = get_ranges_for_endpoint(keyspace_name, endpoint);
 
     logger.debug("Node {} ranges [{}]", endpoint, ranges);
 
-    std::unordered_map<range<token>, std::vector<inet_address>> current_replica_endpoints;
+    std::unordered_map<dht::token_range, std::vector<inet_address>> current_replica_endpoints;
 
     // Find (for each range) all nodes that store replicas for these ranges as well
     auto metadata = _token_metadata.clone_only_token_map(); // don't do this in the loop! #7758
@@ -2310,7 +2419,7 @@ std::unordered_multimap<range<token>, inet_address> storage_service::get_changed
         temp.remove_endpoint(endpoint);
     }
 
-    std::unordered_multimap<range<token>, inet_address> changed_ranges;
+    std::unordered_multimap<dht::token_range, inet_address> changed_ranges;
 
     // Go through the ranges and for each range check who will be
     // storing replicas for these ranges when the leaving endpoint
@@ -2324,7 +2433,7 @@ std::unordered_multimap<range<token>, inet_address> storage_service::get_changed
 
         auto rg = current_replica_endpoints.equal_range(r);
         for (auto it = rg.first; it != rg.second; it++) {
-            const range<token>& range_ = it->first;
+            const dht::token_range& range_ = it->first;
             std::vector<inet_address>& current_eps = it->second;
             logger.debug("range={}, current_replica_endpoints={}, new_replica_endpoints={}", range_, current_eps, new_replica_endpoints);
             for (auto ep : it->second) {
@@ -2351,7 +2460,7 @@ std::unordered_multimap<range<token>, inet_address> storage_service::get_changed
 
 // Runs inside seastar::async context
 void storage_service::unbootstrap() {
-    std::unordered_map<sstring, std::unordered_multimap<range<token>, inet_address>> ranges_to_stream;
+    std::unordered_map<sstring, std::unordered_multimap<dht::token_range, inet_address>> ranges_to_stream;
 
     auto non_system_keyspaces = _db.local().get_non_system_keyspaces();
     for (const auto& keyspace_name : non_system_keyspaces) {
@@ -2392,21 +2501,21 @@ void storage_service::unbootstrap() {
 }
 
 future<> storage_service::restore_replica_count(inet_address endpoint, inet_address notify_endpoint) {
-    std::unordered_multimap<sstring, std::unordered_map<inet_address, std::vector<range<token>>>> ranges_to_fetch;
+    std::unordered_multimap<sstring, std::unordered_map<inet_address, dht::token_range_vector>> ranges_to_fetch;
 
     auto my_address = get_broadcast_address();
 
     auto non_system_keyspaces = _db.local().get_non_system_keyspaces();
     for (const auto& keyspace_name : non_system_keyspaces) {
-        std::unordered_multimap<range<token>, inet_address> changed_ranges = get_changed_ranges_for_leaving(keyspace_name, endpoint);
-        std::vector<range<token>> my_new_ranges;
+        std::unordered_multimap<dht::token_range, inet_address> changed_ranges = get_changed_ranges_for_leaving(keyspace_name, endpoint);
+        dht::token_range_vector my_new_ranges;
         for (auto& x : changed_ranges) {
             if (x.second == my_address) {
                 my_new_ranges.emplace_back(x.first);
             }
         }
-        std::unordered_multimap<inet_address, range<token>> source_ranges = get_new_source_ranges(keyspace_name, my_new_ranges);
-        std::unordered_map<inet_address, std::vector<range<token>>> tmp;
+        std::unordered_multimap<inet_address, dht::token_range> source_ranges = get_new_source_ranges(keyspace_name, my_new_ranges);
+        std::unordered_map<inet_address, dht::token_range_vector> tmp;
         for (auto& x : source_ranges) {
             tmp[x.first].emplace_back(x.second);
         }
@@ -2415,7 +2524,7 @@ future<> storage_service::restore_replica_count(inet_address endpoint, inet_addr
     auto sp = make_lw_shared<streaming::stream_plan>("Restore replica count");
     for (auto& x: ranges_to_fetch) {
         const sstring& keyspace_name = x.first;
-        std::unordered_map<inet_address, std::vector<range<token>>>& maps = x.second;
+        std::unordered_map<inet_address, dht::token_range_vector>& maps = x.second;
         for (auto& m : maps) {
             auto source = m.first;
             auto ranges = m.second;
@@ -2509,16 +2618,16 @@ void storage_service::leave_ring() {
 
     auto& gossiper = gms::get_local_gossiper();
     auto expire_time = gossiper.compute_expire_time().time_since_epoch().count();
-    gossiper.add_local_application_state(gms::application_state::STATUS, value_factory.left(get_local_tokens(), expire_time)).get();
+    gossiper.add_local_application_state(gms::application_state::STATUS, value_factory.left(get_local_tokens().get0(), expire_time)).get();
     auto delay = std::max(get_ring_delay(), gms::gossiper::INTERVAL);
     logger.info("Announcing that I have left the ring for {}ms", delay.count());
     sleep(delay).get();
 }
 
 future<>
-storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multimap<range<token>, inet_address>> ranges_to_stream_by_keyspace) {
+storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, inet_address>> ranges_to_stream_by_keyspace) {
     // First, we build a list of ranges to stream to each host, per table
-    std::unordered_map<sstring, std::unordered_map<inet_address, std::vector<range<token>>>> sessions_to_stream_by_keyspace;
+    std::unordered_map<sstring, std::unordered_map<inet_address, dht::token_range_vector>> sessions_to_stream_by_keyspace;
     for (auto& entry : ranges_to_stream_by_keyspace) {
         const auto& keyspace = entry.first;
         auto& ranges_with_endpoints = entry.second;
@@ -2527,9 +2636,9 @@ storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multim
             continue;
         }
 
-        std::unordered_map<inet_address, std::vector<range<token>>> ranges_per_endpoint;
+        std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint;
         for (auto& end_point_entry : ranges_with_endpoints) {
-            range<token> r = end_point_entry.first;
+            dht::token_range r = end_point_entry.first;
             inet_address endpoint = end_point_entry.second;
             ranges_per_endpoint[endpoint].emplace_back(r);
         }
@@ -2584,7 +2693,7 @@ future<> storage_service::stream_hints() {
         auto hints_destination_host = candidates.front();
 
         // stream all hints -- range list will be a singleton of "the entire ring"
-        std::vector<range<token>> ranges = {range<token>::make_open_ended_both_sides()};
+        dht::token_range_vector ranges = {dht::token_range::make_open_ended_both_sides()};
         logger.debug("stream_hints: ranges={}", ranges);
 
         auto sp = make_lw_shared<streaming::stream_plan>("Hints");
@@ -2602,7 +2711,7 @@ future<> storage_service::stream_hints() {
 
 future<> storage_service::start_leaving() {
     auto& gossiper = gms::get_local_gossiper();
-    return gossiper.add_local_application_state(application_state::STATUS, value_factory.leaving(get_local_tokens())).then([this] {
+    return gossiper.add_local_application_state(application_state::STATUS, value_factory.leaving(get_local_tokens().get0())).then([this] {
         _token_metadata.add_leaving_endpoint(get_broadcast_address());
         return update_pending_ranges();
     });
@@ -2704,9 +2813,6 @@ future<> storage_service::load_new_sstables(sstring ks_name, sstring cf_name) {
         if (new_tables.size() > 0) {
             new_gen = new_tables.back().generation;
         }
-        if (new_tables.empty() && !eptr) {
-            logger.info("No new SSTables were found for {}.{}", ks_name, cf_name);
-        }
 
         logger.debug("Now accepting writes for sstables with generation larger or equal than {}", new_gen);
         return _db.invoke_on_all([ks_name, cf_name, new_gen] (database& db) {
@@ -2721,25 +2827,18 @@ future<> storage_service::load_new_sstables(sstring ks_name, sstring cf_name) {
             return make_ready_future<std::vector<sstables::entry_descriptor>>(std::move(new_tables));
         });
     }).then([this, ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables) {
-        auto shard = std::hash<sstring>()(cf_name) % smp::count;
-        return _db.invoke_on(shard, [ks_name, cf_name] (database& db) {
-            auto& cf = db.find_column_family(ks_name, cf_name);
-            return cf.flush_upload_dir();
-        }).then([new_tables = std::move(new_tables), ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables_from_upload) mutable {
-            if (new_tables_from_upload.empty()) {
-                logger.info("No new SSTables were found for {}.{} in upload directory", ks_name, cf_name);
-            } else {
-                // merge new sstables found in both column family and upload directories.
-                new_tables.insert(new_tables.end(), new_tables_from_upload.begin(), new_tables_from_upload.end());
+        auto f = distributed_loader::flush_upload_dir(_db, ks_name, cf_name);
+        return f.then([new_tables = std::move(new_tables), ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables_from_upload) mutable {
+            if (new_tables.empty() && new_tables_from_upload.empty()) {
+                logger.info("No new SSTables were found for {}.{}", ks_name, cf_name);
             }
+            // merge new sstables found in both column family and upload directories, if any.
+            new_tables.insert(new_tables.end(), new_tables_from_upload.begin(), new_tables_from_upload.end());
             return make_ready_future<std::vector<sstables::entry_descriptor>>(std::move(new_tables));
         });
     }).then([this, ks_name, cf_name] (std::vector<sstables::entry_descriptor> new_tables) {
-        return _db.invoke_on_all([ks_name = std::move(ks_name), cf_name = std::move(cf_name), new_tables = std::move(new_tables)] (database& db) {
-            auto& cf = db.find_column_family(ks_name, cf_name);
-            return cf.load_new_sstables(new_tables).then([ks_name = std::move(ks_name), cf_name = std::move(cf_name)] {
-                logger.info("Done loading new SSTables for {}.{}", ks_name, cf_name);
-            });
+        return distributed_loader::load_new_sstables(_db, ks_name, cf_name, std::move(new_tables)).then([ks_name, cf_name] {
+            logger.info("Done loading new SSTables for {}.{} for all shards", ks_name, cf_name);
         });
     }).finally([this] {
         _loading_new_sstables = false;
@@ -2758,15 +2857,15 @@ future<> storage_service::shutdown_client_servers() {
     return do_stop_rpc_server().then([this] { return do_stop_native_transport(); });
 }
 
-std::unordered_multimap<inet_address, range<token>>
-storage_service::get_new_source_ranges(const sstring& keyspace_name, const std::vector<range<token>>& ranges) {
+std::unordered_multimap<inet_address, dht::token_range>
+storage_service::get_new_source_ranges(const sstring& keyspace_name, const dht::token_range_vector& ranges) {
     auto my_address = get_broadcast_address();
     auto& fd = gms::get_local_failure_detector();
     auto& ks = _db.local().find_keyspace(keyspace_name);
     auto& strat = ks.get_replication_strategy();
     auto tm = _token_metadata.clone_only_token_map();
-    std::unordered_multimap<range<token>, inet_address> range_addresses = strat.get_range_addresses(tm);
-    std::unordered_multimap<inet_address, range<token>> source_ranges;
+    std::unordered_multimap<dht::token_range, inet_address> range_addresses = strat.get_range_addresses(tm);
+    std::unordered_multimap<inet_address, dht::token_range> source_ranges;
 
     // find alive sources for our new ranges
     for (auto r : ranges) {
@@ -2795,10 +2894,10 @@ storage_service::get_new_source_ranges(const sstring& keyspace_name, const std::
     return source_ranges;
 }
 
-std::pair<std::unordered_set<range<token>>, std::unordered_set<range<token>>>
-storage_service::calculate_stream_and_fetch_ranges(const std::vector<range<token>>& current, const std::vector<range<token>>& updated) {
-    std::unordered_set<range<token>> to_stream;
-    std::unordered_set<range<token>> to_fetch;
+std::pair<std::unordered_set<dht::token_range>, std::unordered_set<dht::token_range>>
+storage_service::calculate_stream_and_fetch_ranges(const dht::token_range_vector& current, const dht::token_range_vector& updated) {
+    std::unordered_set<dht::token_range> to_stream;
+    std::unordered_set<dht::token_range> to_fetch;
 
     for (auto r1 : current) {
         bool intersect = false;
@@ -2839,7 +2938,7 @@ storage_service::calculate_stream_and_fetch_ranges(const std::vector<range<token
         logger.debug("to_fetch  = {}", to_fetch);
     }
 
-    return std::pair<std::unordered_set<range<token>>, std::unordered_set<range<token>>>(to_stream, to_fetch);
+    return std::pair<std::unordered_set<dht::token_range>, std::unordered_set<dht::token_range>>(to_stream, to_fetch);
 }
 
 void storage_service::range_relocator::calculate_to_from_streams(std::unordered_set<token> new_tokens, std::vector<sstring> keyspace_names) {
@@ -2859,30 +2958,30 @@ void storage_service::range_relocator::calculate_to_from_streams(std::unordered_
             auto& ks = ss._db.local().find_keyspace(keyspace);
             auto& strategy = ks.get_replication_strategy();
             // getting collection of the currently used ranges by this keyspace
-            std::vector<range<token>> current_ranges = ss.get_ranges_for_endpoint(keyspace, local_address);
+            dht::token_range_vector current_ranges = ss.get_ranges_for_endpoint(keyspace, local_address);
             // collection of ranges which this node will serve after move to the new token
-            std::vector<range<token>> updated_ranges = strategy.get_pending_address_ranges(token_meta_clone, new_token, local_address);
+            dht::token_range_vector updated_ranges = strategy.get_pending_address_ranges(token_meta_clone, new_token, local_address);
 
             // ring ranges and endpoints associated with them
             // this used to determine what nodes should we ping about range data
-            std::unordered_multimap<range<token>, inet_address> range_addresses = strategy.get_range_addresses(token_meta_clone);
-            std::unordered_map<range<token>, std::vector<inet_address>> range_addresses_map;
+            std::unordered_multimap<dht::token_range, inet_address> range_addresses = strategy.get_range_addresses(token_meta_clone);
+            std::unordered_map<dht::token_range, std::vector<inet_address>> range_addresses_map;
             for (auto& x : range_addresses) {
                 range_addresses_map[x.first].emplace_back(x.second);
             }
 
             // calculated parts of the ranges to request/stream from/to nodes in the ring
             // std::pair(to_stream, to_fetch)
-            std::pair<std::unordered_set<range<token>>, std::unordered_set<range<token>>> ranges_per_keyspace =
+            std::pair<std::unordered_set<dht::token_range>, std::unordered_set<dht::token_range>> ranges_per_keyspace =
                 ss.calculate_stream_and_fetch_ranges(current_ranges, updated_ranges);
             /**
              * In this loop we are going through all ranges "to fetch" and determining
              * nodes in the ring responsible for data we are interested in
              */
-            std::unordered_multimap<range<token>, inet_address> ranges_to_fetch_with_preferred_endpoints;
-            for (range<token> to_fetch : ranges_per_keyspace.second) {
+            std::unordered_multimap<dht::token_range, inet_address> ranges_to_fetch_with_preferred_endpoints;
+            for (dht::token_range to_fetch : ranges_per_keyspace.second) {
                 for (auto& x : range_addresses_map) {
-                    const range<token>& r = x.first;
+                    const dht::token_range& r = x.first;
                     std::vector<inet_address>& eps = x.second;
                     if (r.contains(to_fetch, dht::token_comparator())) {
                         std::vector<inet_address> endpoints;
@@ -2945,9 +3044,9 @@ void storage_service::range_relocator::calculate_to_from_streams(std::unordered_
             }
             // calculating endpoints to stream current ranges to if needed
             // in some situations node will handle current ranges as part of the new ranges
-            std::unordered_multimap<inet_address, range<token>> endpoint_ranges;
-            std::unordered_map<inet_address, std::vector<range<token>>> endpoint_ranges_map;
-            for (range<token> to_stream : ranges_per_keyspace.first) {
+            std::unordered_multimap<inet_address, dht::token_range> endpoint_ranges;
+            std::unordered_map<inet_address, dht::token_range_vector> endpoint_ranges_map;
+            for (dht::token_range to_stream : ranges_per_keyspace.first) {
                 auto end_token = to_stream.end() ? to_stream.end()->value() : dht::maximum_token();
                 std::vector<inet_address> current_endpoints = strategy.calculate_natural_endpoints(end_token, token_meta_clone);
                 std::vector<inet_address> new_endpoints = strategy.calculate_natural_endpoints(end_token, token_meta_clone_all_settled);
@@ -2976,9 +3075,9 @@ void storage_service::range_relocator::calculate_to_from_streams(std::unordered_
             }
 
             // stream requests
-            std::unordered_multimap<inet_address, range<token>> work =
+            std::unordered_multimap<inet_address, dht::token_range> work =
                 dht::range_streamer::get_work_map(ranges_to_fetch_with_preferred_endpoints, keyspace);
-            std::unordered_map<inet_address, std::vector<range<token>>> work_map;
+            std::unordered_map<inet_address, dht::token_range_vector> work_map;
             for (auto& x : work) {
                 work_map[x.first].emplace_back(x.second);
             }
@@ -3027,7 +3126,7 @@ future<> storage_service::move(token new_token) {
             }
 
             gms::get_local_gossiper().add_local_application_state(application_state::STATUS, ss.value_factory.moving(new_token)).get();
-            ss.set_mode(mode::MOVING, sprint("Moving %s from %s to %s.", local_address, *(ss.get_local_tokens().begin()), new_token), true);
+            ss.set_mode(mode::MOVING, sprint("Moving %s from %s to %s.", local_address, *(ss.get_local_tokens().get0().begin()), new_token), true);
 
             ss.set_mode(mode::MOVING, sprint("Sleeping %d ms before start streaming/fetching ranges", ss.get_ring_delay().count()), true);
             sleep(ss.get_ring_delay()).get();
@@ -3047,10 +3146,72 @@ future<> storage_service::move(token new_token) {
 
             ss.set_tokens(std::unordered_set<token>{new_token}); // setting new token as we have everything settled
 
-            logger.debug("Successfully moved to new token {}", *(ss.get_local_tokens().begin()));
+            logger.debug("Successfully moved to new token {}", *(ss.get_local_tokens().get0().begin()));
         });
     });
 }
+
+std::vector<storage_service::token_range_endpoints>
+storage_service::describe_ring(const sstring& keyspace, bool include_only_local_dc) const {
+    std::vector<token_range_endpoints> ranges;
+    //Token.TokenFactory tf = getPartitioner().getTokenFactory();
+
+    std::unordered_map<dht::token_range, std::vector<inet_address>> range_to_address_map =
+            include_only_local_dc
+                    ? get_range_to_address_map_in_local_dc(keyspace)
+                    : get_range_to_address_map(keyspace);
+    for (auto entry : range_to_address_map) {
+        auto range = entry.first;
+        auto addresses = entry.second;
+        token_range_endpoints tr;
+        if (range.start()) {
+            tr._start_token = dht::global_partitioner().to_sstring(range.start()->value());
+        }
+        if (range.end()) {
+            tr._end_token = dht::global_partitioner().to_sstring(range.end()->value());
+        }
+        for (auto endpoint : addresses) {
+            endpoint_details details;
+            details._host = boost::lexical_cast<std::string>(endpoint);
+            details._datacenter = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_datacenter(endpoint);
+            details._rack = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_rack(endpoint);
+            tr._rpc_endpoints.push_back(get_rpc_address(endpoint));
+            tr._endpoints.push_back(details._host);
+            tr._endpoint_details.push_back(details);
+        }
+        ranges.push_back(tr);
+    }
+    // Convert to wrapping ranges
+    auto left_inf = boost::find_if(ranges, [] (const token_range_endpoints& tr) {
+        return tr._start_token.empty();
+    });
+    auto right_inf = boost::find_if(ranges, [] (const token_range_endpoints& tr) {
+        return tr._end_token.empty();
+    });
+    using set = std::unordered_set<sstring>;
+    if (left_inf != right_inf
+            && left_inf != ranges.end()
+            && right_inf != ranges.end()
+            && (boost::copy_range<set>(left_inf->_endpoints)
+                 == boost::copy_range<set>(right_inf->_endpoints))) {
+        left_inf->_start_token = std::move(right_inf->_start_token);
+        ranges.erase(right_inf);
+    }
+    return ranges;
+}
+
+std::unordered_map<dht::token_range, std::vector<inet_address>>
+storage_service::construct_range_to_endpoint_map(
+        const sstring& keyspace,
+        const dht::token_range_vector& ranges) const {
+    std::unordered_map<dht::token_range, std::vector<inet_address>> res;
+    for (auto r : ranges) {
+        res[r] = _db.local().find_keyspace(keyspace).get_replication_strategy().get_natural_endpoints(
+                r.end() ? r.end()->value() : dht::maximum_token());
+    }
+    return res;
+}
+
 
 std::map<token, inet_address> storage_service::get_token_to_endpoint_map() {
     return _token_metadata.get_normal_and_bootstrapping_token_to_endpoint_map();
@@ -3186,6 +3347,101 @@ future<> storage_service::force_remove_completion() {
             }
         });
     });
+}
+
+/**
+ * Takes an ordered list of adjacent tokens and divides them in the specified number of ranges.
+ */
+static std::vector<std::pair<dht::token_range, uint64_t>>
+calculate_splits(std::vector<dht::token> tokens, uint32_t split_count, column_family& cf) {
+    auto sstables = cf.get_sstables();
+    const double step = static_cast<double>(tokens.size() - 1) / split_count;
+    auto prev_token_idx = 0;
+    std::vector<std::pair<dht::token_range, uint64_t>> splits;
+    splits.reserve(split_count);
+    for (uint32_t i = 1; i <= split_count; ++i) {
+        auto index = static_cast<uint32_t>(std::round(i * step));
+        dht::token_range range({{ std::move(tokens[prev_token_idx]), false }}, {{ tokens[index], true }});
+        // always return an estimate > 0 (see CASSANDRA-7322)
+        uint64_t estimated_keys_for_range = 0;
+        for (auto&& sst : *sstables) {
+            estimated_keys_for_range += sst->estimated_keys_for_range(range);
+        }
+        splits.emplace_back(std::move(range), std::max(static_cast<uint64_t>(cf.schema()->min_index_interval()), estimated_keys_for_range));
+        prev_token_idx = index;
+    }
+    return splits;
+};
+
+std::vector<std::pair<dht::token_range, uint64_t>>
+storage_service::get_splits(const sstring& ks_name, const sstring& cf_name, range<dht::token> range, uint32_t keys_per_split) {
+    using range_type = dht::token_range;
+    auto& cf = _db.local().find_column_family(ks_name, cf_name);
+    auto schema = cf.schema();
+    auto sstables = cf.get_sstables();
+    uint64_t total_row_count_estimate = 0;
+    std::vector<dht::token> tokens;
+    std::vector<range_type> unwrapped;
+    if (range.is_wrap_around(dht::token_comparator())) {
+        auto uwr = range.unwrap();
+        unwrapped.emplace_back(std::move(uwr.second));
+        unwrapped.emplace_back(std::move(uwr.first));
+    } else {
+        unwrapped.emplace_back(std::move(range));
+    }
+    tokens.push_back(std::move(unwrapped[0].start().value_or(range_type::bound(dht::minimum_token()))).value());
+    for (auto&& r : unwrapped) {
+        std::vector<dht::token> range_tokens;
+        for (auto &&sst : *sstables) {
+            total_row_count_estimate += sst->estimated_keys_for_range(r);
+            auto keys = sst->get_key_samples(*cf.schema(), r);
+            std::transform(keys.begin(), keys.end(), std::back_inserter(range_tokens), [](auto&& k) { return std::move(k.token()); });
+        }
+        std::sort(range_tokens.begin(), range_tokens.end());
+        std::move(range_tokens.begin(), range_tokens.end(), std::back_inserter(tokens));
+    }
+    tokens.push_back(std::move(unwrapped[unwrapped.size() - 1].end().value_or(range_type::bound(dht::maximum_token()))).value());
+
+    // split_count should be much smaller than number of key samples, to avoid huge sampling error
+    constexpr uint32_t min_samples_per_split = 4;
+    uint64_t max_split_count = tokens.size() / min_samples_per_split + 1;
+    uint32_t split_count = std::max(uint32_t(1), static_cast<uint32_t>(std::min(max_split_count, total_row_count_estimate / keys_per_split)));
+
+    return calculate_splits(std::move(tokens), split_count, cf);
+};
+
+dht::token_range_vector
+storage_service::get_ranges_for_endpoint(const sstring& name, const gms::inet_address& ep) const {
+    return _db.local().find_keyspace(name).get_replication_strategy().get_ranges(ep);
+}
+
+dht::token_range_vector
+storage_service::get_all_ranges(const std::vector<token>& sorted_tokens) const {
+    if (sorted_tokens.empty())
+        return dht::token_range_vector();
+    int size = sorted_tokens.size();
+    dht::token_range_vector ranges;
+    ranges.push_back(dht::token_range::make_ending_with(range_bound<token>(sorted_tokens[0], true)));
+    for (int i = 1; i < size; ++i) {
+        dht::token_range r(range<token>::bound(sorted_tokens[i - 1], false), range<token>::bound(sorted_tokens[i], true));
+        ranges.push_back(r);
+    }
+    ranges.push_back(dht::token_range::make_starting_with(range_bound<token>(sorted_tokens[size-1], false)));
+
+    return ranges;
+}
+
+std::vector<gms::inet_address>
+storage_service::get_natural_endpoints(const sstring& keyspace,
+        const sstring& cf, const sstring& key) const {
+    sstables::key_view key_view = sstables::key_view(bytes_view(reinterpret_cast<const signed char*>(key.c_str()), key.size()));
+    dht::token token = dht::global_partitioner().get_token(key_view);
+    return get_natural_endpoints(keyspace, token);
+}
+
+std::vector<gms::inet_address>
+storage_service::get_natural_endpoints(const sstring& keyspace, const token& pos) const {
+    return _db.local().find_keyspace(keyspace).get_replication_strategy().get_natural_endpoints(pos);
 }
 
 } // namespace service

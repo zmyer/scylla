@@ -36,15 +36,18 @@ options {
 #include "cql3/statements/raw/select_statement.hh"
 #include "cql3/statements/alter_keyspace_statement.hh"
 #include "cql3/statements/alter_table_statement.hh"
+#include "cql3/statements/alter_view_statement.hh"
 #include "cql3/statements/create_keyspace_statement.hh"
 #include "cql3/statements/drop_keyspace_statement.hh"
 #include "cql3/statements/create_index_statement.hh"
 #include "cql3/statements/create_table_statement.hh"
+#include "cql3/statements/create_view_statement.hh"
 #include "cql3/statements/create_type_statement.hh"
 #include "cql3/statements/drop_type_statement.hh"
 #include "cql3/statements/alter_type_statement.hh"
 #include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/drop_table_statement.hh"
+#include "cql3/statements/drop_view_statement.hh"
 #include "cql3/statements/truncate_statement.hh"
 #include "cql3/statements/raw/update_statement.hh"
 #include "cql3/statements/raw/insert_statement.hh"
@@ -340,6 +343,9 @@ cqlStatement returns [shared_ptr<raw::parsed_statement> stmt]
     | st30=createAggregateStatement    { $stmt = st30; }
     | st31=dropAggregateStatement      { $stmt = st31; }
 #endif
+    | st32=createViewStatement         { $stmt = st32; }
+    | st33=alterViewStatement          { $stmt = st33; }
+    | st34=dropViewStatement           { $stmt = st34; }
     ;
 
 /*
@@ -716,7 +722,7 @@ createTableStatement returns [shared_ptr<cql3::statements::create_table_statemen
 
 cfamDefinition[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
     : '(' cfamColumns[expr] ( ',' cfamColumns[expr]? )* ')'
-      ( K_WITH cfamProperty[expr] ( K_AND cfamProperty[expr] )*)?
+      ( K_WITH cfamProperty[$expr->properties()] ( K_AND cfamProperty[$expr->properties()] )*)?
     ;
 
 cfamColumns[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
@@ -732,15 +738,15 @@ pkDef[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
     | '(' k1=ident { l.push_back(k1); } ( ',' kn=ident { l.push_back(kn); } )* ')' { $expr->add_key_aliases(l); }
     ;
 
-cfamProperty[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
-    : property[expr->properties]
-    | K_COMPACT K_STORAGE { $expr->set_compact_storage(); }
+cfamProperty[cql3::statements::cf_properties& expr]
+    : property[$expr.properties()]
+    | K_COMPACT K_STORAGE { $expr.set_compact_storage(); }
     | K_CLUSTERING K_ORDER K_BY '(' cfamOrdering[expr] (',' cfamOrdering[expr])* ')'
     ;
 
-cfamOrdering[shared_ptr<cql3::statements::create_table_statement::raw_statement> expr]
+cfamOrdering[cql3::statements::cf_properties& expr]
     @init{ bool reversed=false; }
-    : k=ident (K_ASC | K_DESC { reversed=true;} ) { $expr->set_ordering(k, reversed); }
+    : k=ident (K_ASC | K_DESC { reversed=true;} ) { $expr.set_ordering(k, reversed); }
     ;
 
 
@@ -787,6 +793,39 @@ indexIdent returns [::shared_ptr<index_target::raw> id]
     | K_FULL '(' c=cident ')'    { $id = index_target::raw::full_collection(c); }
     ;
 
+/**
+ * CREATE MATERIALIZED VIEW <viewName> AS
+ *  SELECT <columns>
+ *  FROM <CF>
+ *  WHERE <pkColumns> IS NOT NULL
+ *  PRIMARY KEY (<pkColumns>)
+ *  WITH <property> = <value> AND ...;
+ */
+createViewStatement returns [::shared_ptr<create_view_statement> expr]
+    @init {
+        bool if_not_exists = false;
+        std::vector<::shared_ptr<cql3::column_identifier::raw>> partition_keys;
+        std::vector<::shared_ptr<cql3::column_identifier::raw>> composite_keys;
+    }
+    : K_CREATE K_MATERIALIZED K_VIEW (K_IF K_NOT K_EXISTS { if_not_exists = true; })? cf=columnFamilyName K_AS
+        K_SELECT sclause=selectClause K_FROM basecf=columnFamilyName
+        (K_WHERE wclause=whereClause)?
+        K_PRIMARY K_KEY (
+        '(' '(' k1=cident { partition_keys.push_back(k1); } ( ',' kn=cident { partition_keys.push_back(kn); } )* ')' ( ',' c1=cident { composite_keys.push_back(c1); } )* ')'
+    |   '(' k1=cident { partition_keys.push_back(k1); } ( ',' cn=cident { composite_keys.push_back(cn); } )* ')'
+        )
+        {
+             $expr = ::make_shared<create_view_statement>(
+                std::move(cf),
+                std::move(basecf),
+                std::move(sclause),
+                std::move(wclause),
+                std::move(partition_keys),
+                std::move(composite_keys),
+                if_not_exists);
+        }
+        ( K_WITH cfamProperty[{ $expr->properties() }] ( K_AND cfamProperty[{ $expr->properties() }] )*)?
+    ;
 
 #if 0
 /**
@@ -833,7 +872,7 @@ alterKeyspaceStatement returns [shared_ptr<cql3::statements::alter_keyspace_stat
 alterTableStatement returns [shared_ptr<alter_table_statement> expr]
     @init {
         alter_table_statement::type type;
-        auto props = make_shared<cql3::statements::cf_prop_defs>();;
+        auto props = make_shared<cql3::statements::cf_prop_defs>();
         std::vector<std::pair<shared_ptr<cql3::column_identifier::raw>, shared_ptr<cql3::column_identifier::raw>>> renames;
         bool is_static = false;
     }
@@ -867,6 +906,18 @@ alterTypeStatement returns [::shared_ptr<alter_type_statement> expr]
           )
     ;
 
+/**
+ * ALTER MATERIALIZED VIEW <CF> WITH <property> = <value>;
+ */
+alterViewStatement returns [::shared_ptr<alter_view_statement> expr]
+    @init {
+        auto props = make_shared<cql3::statements::cf_prop_defs>();
+    }
+    : K_ALTER K_MATERIALIZED K_VIEW cf=columnFamilyName K_WITH properties[props]
+    {
+        $expr = ::make_shared<alter_view_statement>(std::move(cf), std::move(props));
+    }
+    ;
 
 renames[::shared_ptr<alter_type_statement::renames> expr]
     : fromId=ident K_TO toId=ident { $expr->add_rename(fromId, toId); }
@@ -895,6 +946,15 @@ dropTableStatement returns [::shared_ptr<drop_table_statement> stmt]
 dropTypeStatement returns [::shared_ptr<drop_type_statement> stmt]
     @init { bool if_exists = false; }
     : K_DROP K_TYPE (K_IF K_EXISTS { if_exists = true; } )? name=userTypeName { $stmt = ::make_shared<drop_type_statement>(name, if_exists); }
+    ;
+
+/**
+ * DROP MATERIALIZED VIEW [IF EXISTS] <view_name>
+ */
+dropViewStatement returns [::shared_ptr<drop_view_statement> stmt]
+    @init { bool if_exists = false; }
+    : K_DROP K_MATERIALIZED K_VIEW (K_IF K_EXISTS { if_exists = true; } )? cf=columnFamilyName
+      { $stmt = ::make_shared<drop_view_statement>(cf, if_exists); }
     ;
 
 #if 0
@@ -1304,7 +1364,8 @@ relation[std::vector<cql3::relation_ptr>& clauses]
 
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
         { $clauses.emplace_back(::make_shared<cql3::token_relation>(std::move(l), *type, std::move(t))); }
-
+    | name=cident K_IS K_NOT K_NULL {
+          $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IS_NOT, cql3::constants::NULL_LITERAL)); }
     | name=cident K_IN marker=inMarker
         { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IN, std::move(marker))); }
     | name=cident K_IN in_values=singleColumnInValues
@@ -1404,12 +1465,16 @@ native_type returns [shared_ptr<cql3_type> t]
     | K_FLOAT     { $t = cql3_type::float_; }
     | K_INET      { $t = cql3_type::inet; }
     | K_INT       { $t = cql3_type::int_; }
+    | K_SMALLINT  { $t = cql3_type::smallint; }
     | K_TEXT      { $t = cql3_type::text; }
     | K_TIMESTAMP { $t = cql3_type::timestamp; }
+    | K_TINYINT   { $t = cql3_type::tinyint; }
     | K_UUID      { $t = cql3_type::uuid; }
     | K_VARCHAR   { $t = cql3_type::varchar; }
     | K_VARINT    { $t = cql3_type::varint; }
     | K_TIMEUUID  { $t = cql3_type::timeuuid; }
+    | K_DATE      { $t = cql3_type::date; }
+    | K_TIME      { $t = cql3_type::time; }
     ;
 
 collection_type returns [shared_ptr<cql3::cql3_type::raw> pt]
@@ -1528,6 +1593,8 @@ K_KEYSPACE:    ( K E Y S P A C E
 K_KEYSPACES:   K E Y S P A C E S;
 K_COLUMNFAMILY:( C O L U M N F A M I L Y
                  | T A B L E );
+K_MATERIALIZED:M A T E R I A L I Z E D;
+K_VIEW:        V I E W;
 K_INDEX:       I N D E X;
 K_CUSTOM:      C U S T O M;
 K_ON:          O N;
@@ -1551,6 +1618,7 @@ K_DESC:        D E S C;
 K_ALLOW:       A L L O W;
 K_FILTERING:   F I L T E R I N G;
 K_IF:          I F;
+K_IS:          I S;
 K_CONTAINS:    C O N T A I N S;
 
 K_GRANT:       G R A N T;
@@ -1580,6 +1648,8 @@ K_DOUBLE:      D O U B L E;
 K_FLOAT:       F L O A T;
 K_INET:        I N E T;
 K_INT:         I N T;
+K_SMALLINT:    S M A L L I N T;
+K_TINYINT:     T I N Y I N T;
 K_TEXT:        T E X T;
 K_UUID:        U U I D;
 K_VARCHAR:     V A R C H A R;
@@ -1587,6 +1657,8 @@ K_VARINT:      V A R I N T;
 K_TIMEUUID:    T I M E U U I D;
 K_TOKEN:       T O K E N;
 K_WRITETIME:   W R I T E T I M E;
+K_DATE:        D A T E;
+K_TIME:        T I M E;
 
 K_NULL:        N U L L;
 K_NOT:         N O T;

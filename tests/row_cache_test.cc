@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/sleep.hh>
@@ -102,11 +101,9 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying) {
         auto m = make_new_mutation(s);
 
         cache_tracker tracker;
-        row_cache cache(s, mutation_source([m] (schema_ptr s, const query::partition_range&) {
+        row_cache cache(s, mutation_source([m] (schema_ptr s, const dht::partition_range&) {
             assert(m.schema() == s);
             return make_reader_returning(m);
-        }), key_source([m] (auto&&) {
-            return make_key_from_mutation_reader(make_reader_returning(m));
         }), tracker);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
@@ -122,11 +119,9 @@ SEASTAR_TEST_CASE(test_cache_works_after_clearing) {
         auto m = make_new_mutation(s);
 
         cache_tracker tracker;
-        row_cache cache(s, mutation_source([m] (schema_ptr s, const query::partition_range&) {
+        row_cache cache(s, mutation_source([m] (schema_ptr s, const dht::partition_range&) {
             assert(m.schema() == s);
             return make_reader_returning(m);
-        }), key_source([m] (auto&&) {
-            return make_key_from_mutation_reader(make_reader_returning(m));
         }), tracker);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
@@ -141,28 +136,48 @@ SEASTAR_TEST_CASE(test_cache_works_after_clearing) {
     });
 }
 
+class partition_counting_reader final : public mutation_reader::impl {
+    mutation_reader _reader;
+    int& _counter;
+public:
+    partition_counting_reader(mutation_reader mr, int& counter)
+        : _reader(std::move(mr)), _counter(counter) { }
+
+    virtual future<streamed_mutation_opt> operator()() override {
+        _counter++;
+        return _reader();
+    }
+
+    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+        return _reader.fast_forward_to(pr);
+    }
+};
+
+mutation_reader make_counting_reader(mutation_reader mr, int& counter) {
+    return make_mutation_reader<partition_counting_reader>(std::move(mr), counter);
+}
+
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_for_wide_partition_full_range) {
     return seastar::async([] {
         auto s = make_schema();
         auto m = make_new_mutation(s);
         int secondary_calls_count = 0;
         cache_tracker tracker;
-        row_cache cache(s, mutation_source([&secondary_calls_count, &m] (schema_ptr s, const query::partition_range& range) {
-            ++secondary_calls_count;
-            return make_reader_returning(m);
-        }), key_source([&m] (auto&&) {
-            return make_key_from_mutation_reader(make_reader_returning(m));
+        row_cache cache(s, mutation_source([&secondary_calls_count, &m] (schema_ptr s, const dht::partition_range& range) {
+            return make_counting_reader(make_reader_returning(m), secondary_calls_count);
         }), tracker, 0);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces(m)
             .produces_end_of_stream();
-        BOOST_REQUIRE_EQUAL(secondary_calls_count, 2);
+        // 2 from cache reader (m & eos) + 1 from large partition read
+        BOOST_REQUIRE_EQUAL(secondary_calls_count, 3);
         BOOST_REQUIRE_EQUAL(tracker.uncached_wide_partitions(), 1);
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces(m)
             .produces_end_of_stream();
-        BOOST_REQUIRE_EQUAL(secondary_calls_count, 3);
+        // previous 3 + 1 from large partition read
+        BOOST_REQUIRE_EQUAL(secondary_calls_count, 4);
         BOOST_REQUIRE_EQUAL(tracker.uncached_wide_partitions(), 2);
     });
 }
@@ -173,22 +188,21 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_for_wide_partitio
         auto m = make_new_mutation(s);
         int secondary_calls_count = 0;
         cache_tracker tracker;
-        row_cache cache(s, mutation_source([&secondary_calls_count, &m] (schema_ptr s, const query::partition_range& range) {
-            ++secondary_calls_count;
-            return make_reader_returning(m);
-        }), key_source([&m] (auto&&) {
-            return make_key_from_mutation_reader(make_reader_returning(m));
+        row_cache cache(s, mutation_source([&secondary_calls_count, &m] (schema_ptr s, const dht::partition_range& range) {
+            return make_counting_reader(make_reader_returning(m), secondary_calls_count);
         }), tracker, 0);
 
-        assert_that(cache.make_reader(s, query::partition_range::make_singular(query::ring_position(m.decorated_key()))))
-            .produces(m)
-            .produces_end_of_stream();
-        BOOST_REQUIRE_EQUAL(secondary_calls_count, 2);
-        BOOST_REQUIRE_EQUAL(tracker.uncached_wide_partitions(), 1);
-        assert_that(cache.make_reader(s, query::partition_range::make_singular(query::ring_position(m.decorated_key()))))
+        auto singular_range = dht::partition_range::make_singular(query::ring_position(m.decorated_key()));
+
+        assert_that(cache.make_reader(s, singular_range))
             .produces(m)
             .produces_end_of_stream();
         BOOST_REQUIRE_EQUAL(secondary_calls_count, 3);
+        BOOST_REQUIRE_EQUAL(tracker.uncached_wide_partitions(), 1);
+        assert_that(cache.make_reader(s, singular_range))
+            .produces(m)
+            .produces_end_of_stream();
+        BOOST_REQUIRE_EQUAL(secondary_calls_count, 5);
         BOOST_REQUIRE_EQUAL(tracker.uncached_wide_partitions(), 2);
     });
 }
@@ -196,49 +210,43 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_for_wide_partitio
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_empty_full_range) {
     return seastar::async([] {
         auto s = make_schema();
-        std::atomic<int> secondary_calls_count{0};
+        int secondary_calls_count = 0;
         cache_tracker tracker;
-        row_cache cache(s, mutation_source([&secondary_calls_count] (schema_ptr s, const query::partition_range& range) {
-            ++secondary_calls_count;
-            return make_empty_reader();
-        }), key_source([] (auto&&) {
-            return make_key_from_mutation_reader(make_empty_reader());
+        row_cache cache(s, mutation_source([&secondary_calls_count] (schema_ptr s, const dht::partition_range& range) {
+            return make_counting_reader(make_empty_reader(), secondary_calls_count);
         }), tracker);
 
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces_end_of_stream();
-        BOOST_REQUIRE_EQUAL(secondary_calls_count.load(), 1);
+        BOOST_REQUIRE_EQUAL(secondary_calls_count, 1);
         assert_that(cache.make_reader(s, query::full_partition_range))
             .produces_end_of_stream();
-        BOOST_REQUIRE_EQUAL(secondary_calls_count.load(), 1);
+        BOOST_REQUIRE_EQUAL(secondary_calls_count, 1);
     });
 }
 
 void test_cache_delegates_to_underlying_only_once_with_single_partition(schema_ptr s,
                                                                         const mutation& m,
-                                                                        const query::partition_range& range) {
-    std::atomic<int> secondary_calls_count{0};
+                                                                        const dht::partition_range& range) {
+    int secondary_calls_count = 0;
     cache_tracker tracker;
-    row_cache cache(s, mutation_source([m, &secondary_calls_count] (schema_ptr s, const query::partition_range& range) {
+    row_cache cache(s, mutation_source([m, &secondary_calls_count] (schema_ptr s, const dht::partition_range& range) {
         assert(m.schema() == s);
-        ++secondary_calls_count;
         if (range.contains(dht::ring_position(m.decorated_key()), dht::ring_position_comparator(*s))) {
-            return make_reader_returning(m);
+            return make_counting_reader(make_reader_returning(m), secondary_calls_count);
         } else {
-            return make_empty_reader();
+            return make_counting_reader(make_empty_reader(), secondary_calls_count);
         }
-    }), key_source([m] (auto&&) {
-        return make_key_from_mutation_reader(make_reader_returning(m));
     }), tracker);
 
     assert_that(cache.make_reader(s, range))
         .produces(m)
         .produces_end_of_stream();
-    BOOST_REQUIRE_EQUAL(secondary_calls_count.load(), 1);
+    BOOST_REQUIRE_EQUAL(secondary_calls_count, 2);
     assert_that(cache.make_reader(s, range))
         .produces(m)
         .produces_end_of_stream();
-    BOOST_REQUIRE_EQUAL(secondary_calls_count.load(), 1);
+    BOOST_REQUIRE_EQUAL(secondary_calls_count, 2);
 }
 
 SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_single_key_range) {
@@ -246,7 +254,7 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_single_key_range)
         auto s = make_schema();
         auto m = make_new_mutation(s);
         test_cache_delegates_to_underlying_only_once_with_single_partition(s, m,
-            query::partition_range::make_singular(query::ring_position(m.decorated_key())));
+            dht::partition_range::make_singular(query::ring_position(m.decorated_key())));
     });
 }
 
@@ -258,24 +266,12 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_full_range) {
     });
 }
 
-SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_range_open_exclusive) {
+SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_range_open) {
     return seastar::async([] {
         auto s = make_schema();
         auto m = make_new_mutation(s);
-        query::partition_range::bound start = {dht::ring_position::starting_at(dht::minimum_token()), false};
-        query::partition_range::bound end = {dht::ring_position(m.decorated_key()), true};
-        query::partition_range range = query::partition_range::make(start, end);
-        test_cache_delegates_to_underlying_only_once_with_single_partition(s, m, range);
-    });
-}
-
-SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_range_inclusive) {
-    return seastar::async([] {
-        auto s = make_schema();
-        auto m = make_new_mutation(s);
-        query::partition_range::bound start = {dht::ring_position::starting_at(dht::minimum_token()), true};
-        query::partition_range::bound end = {dht::ring_position(m.decorated_key()), true};
-        query::partition_range range = query::partition_range::make(start, end);
+        dht::partition_range::bound end = {dht::ring_position(m.decorated_key()), true};
+        dht::partition_range range = dht::partition_range::make_ending_with(end);
         test_cache_delegates_to_underlying_only_once_with_single_partition(s, m, range);
     });
 }
@@ -330,143 +326,152 @@ SEASTAR_TEST_CASE(test_cache_delegates_to_underlying_only_once_multiple_mutation
         }
 
         auto make_cache = [&tracker, &mt](schema_ptr s, int& secondary_calls_count) -> lw_shared_ptr<row_cache> {
-            auto secondary = mutation_source([&mt, &secondary_calls_count] (schema_ptr s, const query::partition_range& range) {
-                ++secondary_calls_count;
-                return mt->as_data_source()(s, range);
+            auto secondary = mutation_source([&mt, &secondary_calls_count] (schema_ptr s, const dht::partition_range& range) {
+                return make_counting_reader(mt->as_data_source()(s, range), secondary_calls_count);
             });
 
-            return make_lw_shared<row_cache>(s, secondary, mt->as_key_source(), tracker);
+            return make_lw_shared<row_cache>(s, secondary, tracker);
         };
 
         auto make_ds = [&make_cache](schema_ptr s, int& secondary_calls_count) -> mutation_source {
             auto cache = make_cache(s, secondary_calls_count);
-            return mutation_source([cache] (schema_ptr s, const query::partition_range& range) {
+            return mutation_source([cache] (schema_ptr s, const dht::partition_range& range) {
                 return cache->make_reader(s, range);
             });
         };
 
-        auto test = [&s, &partitions] (const mutation_source& ds, const query::partition_range& range, int& secondary_calls_count) {
+        auto do_test = [&s, &partitions] (const mutation_source& ds, const dht::partition_range& range,
+                                          int& secondary_calls_count, int expected_calls) {
             assert_that(ds(s, range))
                 .produces(slice(partitions, range))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 1, secondary_calls_count);
+            BOOST_CHECK_EQUAL(expected_calls, secondary_calls_count);
         };
 
         {
             int secondary_calls_count = 0;
+            auto test = [&] (const mutation_source& ds, const dht::partition_range& range, int expected_count) {
+                do_test(ds, range, secondary_calls_count, expected_count);
+            };
+            
             auto ds = make_ds(s, secondary_calls_count);
-            test(ds, query::full_partition_range, secondary_calls_count);
-            test(ds, query::full_partition_range, secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions[0].decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions[0].decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions.back().decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions.back().decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions[1].decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions[1].decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions[1].decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions[1].decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions.back().decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_ending_with({partitions.back().decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions[0].decorated_key(), false}), secondary_calls_count);
-            test(ds, query::partition_range::make_starting_with({partitions[0].decorated_key(), true}), secondary_calls_count);
-            test(ds, query::partition_range::make(
+            auto expected = partitions.size() + 1;
+            test(ds, query::full_partition_range, expected);
+            test(ds, query::full_partition_range, expected);
+            test(ds, dht::partition_range::make_ending_with({partitions[0].decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_ending_with({partitions[0].decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions.back().decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions.back().decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make_ending_with({partitions[1].decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_ending_with({partitions[1].decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions[1].decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions[1].decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make_ending_with({partitions.back().decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_ending_with({partitions.back().decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions[0].decorated_key(), false}), expected);
+            test(ds, dht::partition_range::make_starting_with({partitions[0].decorated_key(), true}), expected);
+            test(ds, dht::partition_range::make(
                 {dht::ring_position::starting_at(key_before_all.token())},
                 {dht::ring_position::ending_at(key_after_all.token())}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[1].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), false},
                 {partitions[1].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[1].decorated_key(), false}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), false},
                 {partitions[1].decorated_key(), false}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[1].decorated_key(), true},
                 {partitions[2].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[1].decorated_key(), false},
                 {partitions[2].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[1].decorated_key(), true},
                 {partitions[2].decorated_key(), false}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[1].decorated_key(), false},
                 {partitions[2].decorated_key(), false}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[2].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), false},
                 {partitions[2].decorated_key(), true}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[2].decorated_key(), false}),
-                secondary_calls_count);
-            test(ds, query::partition_range::make(
+                expected);
+            test(ds, dht::partition_range::make(
                 {partitions[0].decorated_key(), false},
                 {partitions[2].decorated_key(), false}),
-                secondary_calls_count);
+                expected);
         }
         {
             int secondary_calls_count = 0;
             auto ds = make_ds(s, secondary_calls_count);
-            auto range = query::partition_range::make(
+            auto range = dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[1].decorated_key(), true});
             assert_that(ds(s, range))
                 .produces(slice(partitions, range))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 1, secondary_calls_count);
+            BOOST_CHECK_EQUAL(3, secondary_calls_count);
             assert_that(ds(s, range))
                 .produces(slice(partitions, range))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 1, secondary_calls_count);
-            auto range2 = query::partition_range::make(
+            BOOST_CHECK_EQUAL(3, secondary_calls_count);
+            auto range2 = dht::partition_range::make(
                 {partitions[0].decorated_key(), true},
                 {partitions[1].decorated_key(), false});
             assert_that(ds(s, range2))
                 .produces(slice(partitions, range2))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 1, secondary_calls_count);
-            auto range3 = query::partition_range::make(
+            BOOST_CHECK_EQUAL(3, secondary_calls_count);
+            auto range3 = dht::partition_range::make(
                 {dht::ring_position::starting_at(key_before_all.token())},
                 {partitions[2].decorated_key(), false});
             assert_that(ds(s, range3))
                 .produces(slice(partitions, range3))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 3, secondary_calls_count);
+            BOOST_CHECK_EQUAL(5, secondary_calls_count);
         }
         {
             int secondary_calls_count = 0;
+            auto test = [&] (const mutation_source& ds, const dht::partition_range& range, int expected_count) {
+                do_test(ds, range, secondary_calls_count, expected_count);
+            };
+
             auto cache = make_cache(s, secondary_calls_count);
-            auto ds = mutation_source([cache] (schema_ptr s, const query::partition_range& range) {
+            auto ds = mutation_source([cache] (schema_ptr s, const dht::partition_range& range) {
                     return cache->make_reader(s, range);
             });
 
-            test(ds, query::full_partition_range, secondary_calls_count);
-            test(ds, query::full_partition_range, secondary_calls_count);
+            test(ds, query::full_partition_range, partitions.size() + 1);
+            test(ds, query::full_partition_range, partitions.size() + 1);
 
             cache->invalidate(key_after_all);
 
             assert_that(ds(s, query::full_partition_range))
                 .produces(slice(partitions, query::full_partition_range))
                 .produces_end_of_stream();
-            BOOST_CHECK_EQUAL( 2, secondary_calls_count);
+            BOOST_CHECK_EQUAL(partitions.size() + 2, secondary_calls_count);
         }
     });
 }
@@ -492,28 +497,31 @@ SEASTAR_TEST_CASE(test_query_of_incomplete_range_goes_to_underlying) {
         }
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         auto get_partition_range = [] (const mutation& m) {
-            return query::partition_range::make_singular(query::ring_position(m.decorated_key()));
+            return dht::partition_range::make_singular(query::ring_position(m.decorated_key()));
         };
 
+        auto key0_range = get_partition_range(mutations[0]);
+        auto key2_range = get_partition_range(mutations[2]);
+
         // Populate cache for first key
-        assert_that(cache.make_reader(s, get_partition_range(mutations[0])))
+        assert_that(cache.make_reader(s, key0_range))
             .produces(mutations[0])
             .produces_end_of_stream();
 
         // Populate cache for last key
-        assert_that(cache.make_reader(s, get_partition_range(mutations[2])))
+        assert_that(cache.make_reader(s, key2_range))
             .produces(mutations[2])
             .produces_end_of_stream();
 
         // Test single-key queries
-        assert_that(cache.make_reader(s, get_partition_range(mutations[0])))
+        assert_that(cache.make_reader(s, key0_range))
             .produces(mutations[0])
             .produces_end_of_stream();
 
-        assert_that(cache.make_reader(s, get_partition_range(mutations[2])))
+        assert_that(cache.make_reader(s, key2_range))
             .produces(mutations[2])
             .produces_end_of_stream();
 
@@ -539,22 +547,26 @@ SEASTAR_TEST_CASE(test_single_key_queries_after_population_in_reverse_order) {
         }
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         auto get_partition_range = [] (const mutation& m) {
-            return query::partition_range::make_singular(query::ring_position(m.decorated_key()));
+            return dht::partition_range::make_singular(query::ring_position(m.decorated_key()));
         };
 
+        auto key0_range = get_partition_range(mutations[0]);
+        auto key1_range = get_partition_range(mutations[1]);
+        auto key2_range = get_partition_range(mutations[2]);
+
         for (int i = 0; i < 2; ++i) {
-            assert_that(cache.make_reader(s, get_partition_range(mutations[2])))
+            assert_that(cache.make_reader(s, key2_range))
                 .produces(mutations[2])
                 .produces_end_of_stream();
 
-            assert_that(cache.make_reader(s, get_partition_range(mutations[1])))
+            assert_that(cache.make_reader(s, key1_range))
                 .produces(mutations[1])
                 .produces_end_of_stream();
 
-            assert_that(cache.make_reader(s, get_partition_range(mutations[0])))
+            assert_that(cache.make_reader(s, key0_range))
                 .produces(mutations[0])
                 .produces_end_of_stream();
         }
@@ -572,8 +584,8 @@ SEASTAR_TEST_CASE(test_row_cache_conforms_to_mutation_source) {
                 mt->apply(m);
             }
 
-            auto cache = make_lw_shared<row_cache>(s, mt->as_data_source(), mt->as_key_source(), tracker);
-            return mutation_source([cache] (schema_ptr s, const query::partition_range& range) {
+            auto cache = make_lw_shared<row_cache>(s, mt->as_data_source(), tracker);
+            return mutation_source([cache] (schema_ptr s, const dht::partition_range& range) {
                 return cache->make_reader(s, range);
             });
         });
@@ -586,7 +598,7 @@ SEASTAR_TEST_CASE(test_eviction) {
         auto mt = make_lw_shared<memtable>(s);
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         std::vector<dht::decorated_key> keys;
         for (int i = 0; i < 100000; i++) {
@@ -598,7 +610,7 @@ SEASTAR_TEST_CASE(test_eviction) {
         std::random_shuffle(keys.begin(), keys.end());
 
         for (auto&& key : keys) {
-            cache.make_reader(s, query::partition_range::make_singular(key));
+            cache.make_reader(s, dht::partition_range::make_singular(key));
         }
 
         while (tracker.partitions() > 0) {
@@ -608,7 +620,7 @@ SEASTAR_TEST_CASE(test_eviction) {
 }
 
 bool has_key(row_cache& cache, const dht::decorated_key& key) {
-    auto range = query::partition_range::make_singular(key);
+    auto range = dht::partition_range::make_singular(key);
     auto reader = cache.make_reader(cache.schema(), range);
     auto mo = reader().get0();
     return bool(mo);
@@ -623,7 +635,7 @@ void verify_does_not_have(row_cache& cache, const dht::decorated_key& key) {
 }
 
 void verify_has(row_cache& cache, const mutation& m) {
-    auto range = query::partition_range::make_singular(m.decorated_key());
+    auto range = dht::partition_range::make_singular(m.decorated_key());
     auto reader = cache.make_reader(cache.schema(), range);
     assert_that(reader().get0()).has_mutation().is_equal_to(m);
 }
@@ -634,7 +646,7 @@ SEASTAR_TEST_CASE(test_update) {
         auto cache_mt = make_lw_shared<memtable>(s);
 
         cache_tracker tracker;
-        row_cache cache(s, cache_mt->as_data_source(), cache_mt->as_key_source(), tracker);
+        row_cache cache(s, cache_mt->as_data_source(), tracker);
 
         BOOST_TEST_MESSAGE("Check cache miss with populate");
 
@@ -719,7 +731,7 @@ SEASTAR_TEST_CASE(test_update_failure) {
         auto cache_mt = make_lw_shared<memtable>(s);
 
         cache_tracker tracker;
-        row_cache cache(s, cache_mt->as_data_source(), cache_mt->as_key_source(), tracker);
+        row_cache cache(s, cache_mt->as_data_source(), tracker);
 
         int partition_count = 1000;
 
@@ -764,7 +776,7 @@ SEASTAR_TEST_CASE(test_update_failure) {
         memory_hog.clear();
 
         // verify that there are no stale partitions
-        auto reader = cache.make_reader(s, query::partition_range::make_open_ended_both_sides());
+        auto reader = cache.make_reader(s, query::full_partition_range);
         for (int i = 0; i < partition_count; i++) {
             auto mopt = mutation_from_streamed_mutation(reader().get0()).get0();
             if (!mopt) {
@@ -835,13 +847,17 @@ private:
                     return _throttle.enter();
                 });
             }
+
+            virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+                return _reader.fast_forward_to(pr);
+            }
         };
     public:
         impl(mutation_source underlying)
             : _underlying(std::move(underlying))
         { }
 
-        mutation_reader make_reader(schema_ptr s, const query::partition_range& pr) {
+        mutation_reader make_reader(schema_ptr s, const dht::partition_range& pr) {
             return make_mutation_reader<reader>(_throttle, _underlying(s, pr));
         }
 
@@ -862,7 +878,7 @@ public:
     }
 
     operator mutation_source() const {
-        return mutation_source([this] (schema_ptr s, const query::partition_range& pr) {
+        return mutation_source([this] (schema_ptr s, const dht::partition_range& pr) {
             return _impl->make_reader(std::move(s), pr);
         });
     }
@@ -877,22 +893,12 @@ static std::vector<mutation> updated_ring(std::vector<mutation>& mutations) {
 }
 
 static mutation_source make_mutation_source(std::vector<lw_shared_ptr<memtable>>& memtables) {
-    return mutation_source([&memtables] (schema_ptr s, const query::partition_range& pr) {
+    return mutation_source([&memtables] (schema_ptr s, const dht::partition_range& pr) {
         std::vector<mutation_reader> readers;
         for (auto&& mt : memtables) {
             readers.emplace_back(mt->make_reader(s, pr));
         }
         return make_combined_reader(std::move(readers));
-    });
-}
-
-static key_source make_key_source(schema_ptr s, std::vector<lw_shared_ptr<memtable>>& memtables) {
-    return key_source([s, &memtables] (const query::partition_range& pr) {
-        std::vector<key_reader> readers;
-        for (auto&& mt : memtables) {
-            readers.emplace_back(mt->as_key_source()(pr));
-        }
-        return make_combined_reader(s, std::move(readers));
     });
 }
 
@@ -902,7 +908,7 @@ SEASTAR_TEST_CASE(test_continuity_flag_and_invalidate_race) {
         lw_shared_ptr<memtable> mt = make_lw_shared<memtable>(s);
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         auto ring = make_ring(s, 4);
         for (auto&& m : ring) {
@@ -910,7 +916,8 @@ SEASTAR_TEST_CASE(test_continuity_flag_and_invalidate_race) {
         }
 
         // Bring ring[2]and ring[3] to cache.
-        assert_that(cache.make_reader(s, query::partition_range::make_starting_with({ ring[2].ring_position(), true })))
+        auto range = dht::partition_range::make_starting_with({ ring[2].ring_position(), true });
+        assert_that(cache.make_reader(s, range))
                 .produces(ring[2])
                 .produces(ring[3])
                 .produces_end_of_stream();
@@ -920,7 +927,7 @@ SEASTAR_TEST_CASE(test_continuity_flag_and_invalidate_race) {
         rd.produces(ring[0]);
 
         // Invalidate ring[2] and ring[3]
-        cache.invalidate(query::partition_range::make_starting_with({ ring[2].ring_position(), true })).get();
+        cache.invalidate(dht::partition_range::make_starting_with({ ring[2].ring_position(), true })).get();
 
         // Continue previous reader.
         rd.produces(ring[1])
@@ -956,7 +963,7 @@ SEASTAR_TEST_CASE(test_cache_population_and_update_race) {
         std::vector<lw_shared_ptr<memtable>> memtables;
         throttled_mutation_source cache_source(make_mutation_source(memtables));
         cache_tracker tracker;
-        row_cache cache(s, cache_source, make_key_source(s, memtables), tracker);
+        row_cache cache(s, cache_source, tracker);
 
         auto mt1 = make_lw_shared<memtable>(s);
         memtables.push_back(mt1);
@@ -973,7 +980,7 @@ SEASTAR_TEST_CASE(test_cache_population_and_update_race) {
 
         cache_source.block();
 
-        auto m0_range = query::partition_range::make_singular(ring[0].ring_position());
+        auto m0_range = dht::partition_range::make_singular(ring[0].ring_position());
         auto rd1 = cache.make_reader(s, m0_range);
         auto rd1_result = rd1();
 
@@ -1026,7 +1033,7 @@ SEASTAR_TEST_CASE(test_invalidate) {
         auto mt = make_lw_shared<memtable>(s);
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         int partition_count = 1000;
 
@@ -1062,7 +1069,7 @@ SEASTAR_TEST_CASE(test_invalidate) {
         });
         auto some_range_begin = keys_in_cache.begin() + 123;
         auto some_range_end = keys_in_cache.begin() + 423;
-        auto range = query::partition_range::make(
+        auto range = dht::partition_range::make(
             { *some_range_begin, true }, { *some_range_end, false }
         );
         keys_not_in_cache.insert(keys_not_in_cache.end(), some_range_begin, some_range_end);
@@ -1084,7 +1091,7 @@ SEASTAR_TEST_CASE(test_cache_population_and_clear_race) {
         std::vector<lw_shared_ptr<memtable>> memtables;
         throttled_mutation_source cache_source(make_mutation_source(memtables));
         cache_tracker tracker;
-        row_cache cache(s, cache_source, make_key_source(s, memtables), tracker);
+        row_cache cache(s, cache_source, tracker);
 
         auto mt1 = make_lw_shared<memtable>(s);
         memtables.push_back(mt1);
@@ -1144,50 +1151,6 @@ SEASTAR_TEST_CASE(test_cache_population_and_clear_race) {
 }
 
 
-SEASTAR_TEST_CASE(test_invalidate_works_with_wrap_arounds) {
-    return seastar::async([] {
-        auto s = make_schema();
-        auto mt = make_lw_shared<memtable>(s);
-
-        cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
-
-        std::vector<mutation> ring = make_ring(s, 8);
-
-        for (auto& m : ring) {
-            cache.populate(m);
-        }
-
-        for (auto& m : ring) {
-            verify_has(cache, m.decorated_key());
-        }
-
-        // wrap-around
-        cache.invalidate(query::partition_range({ring[6].ring_position()}, {ring[1].ring_position()})).get();
-
-        verify_does_not_have(cache, ring[0].decorated_key());
-        verify_does_not_have(cache, ring[1].decorated_key());
-        verify_has(cache, ring[2].decorated_key());
-        verify_has(cache, ring[3].decorated_key());
-        verify_has(cache, ring[4].decorated_key());
-        verify_has(cache, ring[5].decorated_key());
-        verify_does_not_have(cache, ring[6].decorated_key());
-        verify_does_not_have(cache, ring[7].decorated_key());
-
-        // not wrap-around
-        cache.invalidate(query::partition_range({ring[3].ring_position()}, {ring[4].ring_position()})).get();
-
-        verify_does_not_have(cache, ring[0].decorated_key());
-        verify_does_not_have(cache, ring[1].decorated_key());
-        verify_has(cache, ring[2].decorated_key());
-        verify_does_not_have(cache, ring[3].decorated_key());
-        verify_does_not_have(cache, ring[4].decorated_key());
-        verify_has(cache, ring[5].decorated_key());
-        verify_does_not_have(cache, ring[6].decorated_key());
-        verify_does_not_have(cache, ring[7].decorated_key());
-    });
-}
-
 SEASTAR_TEST_CASE(test_mvcc) {
     return seastar::async([] {
         auto no_difference = [] (auto& m1, auto& m2) {
@@ -1195,24 +1158,14 @@ SEASTAR_TEST_CASE(test_mvcc) {
                 && m2.partition().difference(m1.schema(), m1.partition()).empty();
         };
 
-        for_each_mutation_pair([&] (const mutation& m1, const mutation& m2_, are_equal) {
-            if (m1.schema() != m2_.schema()) {
-                return;
-            }
-            if (m1.partition().empty() || m2_.partition().empty()) {
-                return;
-            }
-
+        auto test = [&no_difference] (const mutation& m1, const mutation& m2, bool with_active_memtable_reader) {
             auto s = m1.schema();
-
-            auto m2 = mutation(m1.decorated_key(), s);
-            m2.partition().apply(*s, m2_.partition(), *s);
 
             auto mt = make_lw_shared<memtable>(s);
             partition_key::equality eq(*s);
 
             cache_tracker tracker;
-            row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+            row_cache cache(s, mt->as_data_source(), tracker);
 
             auto pk = m1.key();
             cache.populate(m1);
@@ -1231,7 +1184,15 @@ SEASTAR_TEST_CASE(test_mvcc) {
             auto m12 = m1;
             m12.apply(m2);
 
-            cache.update(*mt1, make_default_partition_presence_checker());
+            stdx::optional<mutation_reader> mt1_reader_opt;
+            stdx::optional<streamed_mutation_opt> mt1_reader_sm_opt;
+            if (with_active_memtable_reader) {
+                mt1_reader_opt = mt1->make_reader(s);
+                mt1_reader_sm_opt = (*mt1_reader_opt)().get0();
+                BOOST_REQUIRE(*mt1_reader_sm_opt);
+            }
+
+            cache.update(*mt1, make_default_partition_presence_checker()).get();
             auto sm3 = cache.make_reader(s)().get0();
             BOOST_REQUIRE(sm3);
             BOOST_REQUIRE(eq(sm3->key(), pk));
@@ -1249,12 +1210,19 @@ SEASTAR_TEST_CASE(test_mvcc) {
             auto mf = (*sm3)().get0();
             while (mf) {
                 if (previous) {
-                    BOOST_REQUIRE(cmp(*previous, *mf));
+                    BOOST_REQUIRE(cmp(*previous, mf->position()));
                 }
-                previous = mf->position();
+                previous = position_in_partition(mf->position());
                 mf = (*sm3)().get0();
             }
             sm3 = { };
+
+            if (with_active_memtable_reader) {
+                assert(mt1_reader_sm_opt);
+                auto mt1_reader_mutation = mutation_from_streamed_mutation(std::move(*mt1_reader_sm_opt)).get0();
+                BOOST_REQUIRE(mt1_reader_mutation);
+                BOOST_REQUIRE(no_difference(m2, *mt1_reader_mutation));
+            }
 
             auto m_4 = mutation_from_streamed_mutation(std::move(sm4)).get0();
             BOOST_REQUIRE(no_difference(m12, *m_4));
@@ -1269,6 +1237,22 @@ SEASTAR_TEST_CASE(test_mvcc) {
 
             auto m_5 = mutation_from_streamed_mutation(std::move(sm5)).get0();
             BOOST_REQUIRE(no_difference(m12, *m_5));
+        };
+
+        for_each_mutation_pair([&] (const mutation& m1, const mutation& m2_, are_equal) {
+            if (m1.schema() != m2_.schema()) {
+                return;
+            }
+            if (m1.partition().empty() || m2_.partition().empty()) {
+                return;
+            }
+            auto s = m1.schema();
+
+            auto m2 = mutation(m1.decorated_key(), m1.schema());
+            m2.partition().apply(*s, m2_.partition(), *s);
+
+            test(m1, m2, false);
+            test(m1, m2, true);
         });
     });
 }
@@ -1312,7 +1296,7 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
         mt->apply(m);
 
         cache_tracker tracker;
-        row_cache cache(s, mt->as_data_source(), mt->as_key_source(), tracker);
+        row_cache cache(s, mt->as_data_source(), tracker);
 
         auto run_tests = [&] (auto& ps, std::deque<int> expected) {
             cache.clear().get0();
@@ -1324,13 +1308,14 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
             test_sliced_read_row_presence(std::move(reader), s, ps, expected);
 
             auto dk = dht::global_partitioner().decorate_key(*s, pk);
+            auto singular_range = dht::partition_range::make_singular(dk);
 
-            reader = cache.make_reader(s, query::partition_range::make_singular(dk), ps);
+            reader = cache.make_reader(s, singular_range, ps);
             test_sliced_read_row_presence(std::move(reader), s, ps, expected);
 
             cache.clear().get0();
 
-            reader = cache.make_reader(s, query::partition_range::make_singular(dk), ps);
+            reader = cache.make_reader(s, singular_range, ps);
             test_sliced_read_row_presence(std::move(reader), s, ps, expected);
         };
 
@@ -1377,5 +1362,63 @@ SEASTAR_TEST_CASE(test_slicing_mutation_reader) {
                     .build();
             run_tests(ps, { 4 });
         }
+    });
+}
+
+SEASTAR_TEST_CASE(test_lru) {
+    return seastar::async([] {
+        auto s = make_schema();
+        auto cache_mt = make_lw_shared<memtable>(s);
+
+        cache_tracker tracker;
+        row_cache cache(s, cache_mt->as_data_source(), tracker);
+
+        int partition_count = 10;
+
+        std::vector<mutation> partitions = make_ring(s, partition_count);
+        for (auto&& m : partitions) {
+            cache.populate(m);
+        }
+
+        auto pr = dht::partition_range::make_ending_with(dht::ring_position(partitions[2].decorated_key()));
+        auto rd = cache.make_reader(s, pr);
+        assert_that(std::move(rd))
+                .produces(partitions[0])
+                .produces(partitions[1])
+                .produces(partitions[2])
+                .produces_end_of_stream();
+
+        auto ret = tracker.region().evict_some();
+        BOOST_REQUIRE(ret == memory::reclaiming_result::reclaimed_something);
+
+        pr = dht::partition_range::make_ending_with(dht::ring_position(partitions[4].decorated_key()));
+        rd = cache.make_reader(s, pr);
+        assert_that(std::move(rd))
+                .produces(partitions[0])
+                .produces(partitions[1])
+                .produces(partitions[2])
+                .produces(partitions[4])
+                .produces_end_of_stream();
+
+        pr = dht::partition_range::make_singular(dht::ring_position(partitions[5].decorated_key()));
+        rd = cache.make_reader(s, pr);
+        assert_that(std::move(rd))
+                .produces(partitions[5])
+                .produces_end_of_stream();
+
+        ret = tracker.region().evict_some();
+        BOOST_REQUIRE(ret == memory::reclaiming_result::reclaimed_something);
+
+        rd = cache.make_reader(s);
+        assert_that(std::move(rd))
+                .produces(partitions[0])
+                .produces(partitions[1])
+                .produces(partitions[2])
+                .produces(partitions[4])
+                .produces(partitions[5])
+                .produces(partitions[7])
+                .produces(partitions[8])
+                .produces(partitions[9])
+                .produces_end_of_stream();
     });
 }

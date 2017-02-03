@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <random>
 #include <boost/range/adaptor/transformed.hpp>
@@ -63,7 +62,7 @@ static atomic_cell make_atomic_cell(bytes value) {
 
 static mutation_partition get_partition(memtable& mt, const partition_key& key) {
     auto dk = dht::global_partitioner().decorate_key(*mt.schema(), key);
-    auto reader = mt.make_reader(mt.schema(), query::partition_range::make_singular(dk));
+    auto reader = mt.make_reader(mt.schema(), dht::partition_range::make_singular(dk));
     auto mo = mutation_from_streamed_mutation(reader().get0()).get0();
     BOOST_REQUIRE(bool(mo));
     return std::move(mo->partition());
@@ -98,7 +97,7 @@ SEASTAR_TEST_CASE(test_mutation_is_applied) {
         mt->apply(std::move(m));
 
         auto p = get_partition(*mt, key);
-        row& r = p.clustered_row(c_key).cells();
+        row& r = p.clustered_row(*s, c_key).cells();
         auto i = r.find_cell(r1_col.id);
         BOOST_REQUIRE(i);
         auto cell = i->as_atomic_cell();
@@ -735,7 +734,7 @@ SEASTAR_TEST_CASE(test_marker_apply) {
 
     auto mutation_with_marker = [&] (row_marker rm) {
         mutation m(pkey, s);
-        m.partition().clustered_row(ckey).marker() = rm;
+        m.partition().clustered_row(*s, ckey).marker() = rm;
         return m;
     };
 
@@ -744,14 +743,14 @@ SEASTAR_TEST_CASE(test_marker_apply) {
         auto marker = row_marker(api::new_timestamp());
         auto mm = mutation_with_marker(marker);
         m.apply(mm);
-        BOOST_REQUIRE_EQUAL(m.partition().clustered_row(ckey).marker(), marker);
+        BOOST_REQUIRE_EQUAL(m.partition().clustered_row(*s, ckey).marker(), marker);
     }
 
     {
         mutation m(pkey, s);
         auto marker = row_marker(api::new_timestamp(), std::chrono::seconds(1), gc_clock::now());
         m.apply(mutation_with_marker(marker));
-        BOOST_REQUIRE_EQUAL(m.partition().clustered_row(ckey).marker(), marker);
+        BOOST_REQUIRE_EQUAL(m.partition().clustered_row(*s, ckey).marker(), marker);
     }
 
     return make_ready_future<>();
@@ -775,6 +774,10 @@ public:
 
     virtual void free(void* ptr) override {
         _delegate.free(ptr);
+    }
+
+    virtual size_t object_memory_size_in_allocator(const void* obj) const noexcept override {
+        return _delegate.object_memory_size_in_allocator(obj);
     }
 
     // Counts allocation attempts which are not failed due to fail_at().
@@ -883,7 +886,7 @@ SEASTAR_TEST_CASE(test_mutation_diff) {
         m1.set_clustered_cell(ckey1, *s->get_column_definition("v2"),
             atomic_cell::make_live(2, bytes_type->decompose(data_value(bytes("v2:value2")))));
 
-        m1.partition().clustered_row(ckey2).apply(row_marker(3));
+        m1.partition().clustered_row(*s, ckey2).apply(row_marker(3));
         m1.set_clustered_cell(ckey2, *s->get_column_definition("v2"),
             atomic_cell::make_live(2, bytes_type->decompose(data_value(bytes("v2:value4")))));
         map_type_impl::mutation mset1 {{}, {{int32_type->decompose(1), make_atomic_cell({})}, {int32_type->decompose(2), make_atomic_cell({})}}};
@@ -923,10 +926,10 @@ SEASTAR_TEST_CASE(test_mutation_diff) {
         auto m2_1 = m2.partition().difference(s, m1.partition());
         BOOST_REQUIRE_EQUAL(m2_1.partition_tombstone(), tombstone());
         BOOST_REQUIRE(!m2_1.static_row().size());
-        BOOST_REQUIRE(!m2_1.find_row(ckey1));
-        BOOST_REQUIRE(m2_1.find_row(ckey2));
-        BOOST_REQUIRE(m2_1.find_row(ckey2)->find_cell(2));
-        auto cmv = m2_1.find_row(ckey2)->find_cell(2)->as_collection_mutation();
+        BOOST_REQUIRE(!m2_1.find_row(*s, ckey1));
+        BOOST_REQUIRE(m2_1.find_row(*s, ckey2));
+        BOOST_REQUIRE(m2_1.find_row(*s, ckey2)->find_cell(2));
+        auto cmv = m2_1.find_row(*s, ckey2)->find_cell(2)->as_collection_mutation();
         auto cm = my_set_type->deserialize_mutation_form(cmv);
         BOOST_REQUIRE(cm.cells.size() == 1);
         BOOST_REQUIRE(cm.cells.front().first == int32_type->decompose(3));
@@ -938,12 +941,12 @@ SEASTAR_TEST_CASE(test_mutation_diff) {
 
         auto m1_2 = m1.partition().difference(s, m2.partition());
         BOOST_REQUIRE_EQUAL(m1_2.partition_tombstone(), m12.partition().partition_tombstone());
-        BOOST_REQUIRE(m1_2.find_row(ckey1));
-        BOOST_REQUIRE(m1_2.find_row(ckey2));
-        BOOST_REQUIRE(!m1_2.find_row(ckey1)->find_cell(1));
-        BOOST_REQUIRE(!m1_2.find_row(ckey2)->find_cell(0));
-        BOOST_REQUIRE(!m1_2.find_row(ckey2)->find_cell(1));
-        cmv = m1_2.find_row(ckey2)->find_cell(2)->as_collection_mutation();
+        BOOST_REQUIRE(m1_2.find_row(*s, ckey1));
+        BOOST_REQUIRE(m1_2.find_row(*s, ckey2));
+        BOOST_REQUIRE(!m1_2.find_row(*s, ckey1)->find_cell(1));
+        BOOST_REQUIRE(!m1_2.find_row(*s, ckey2)->find_cell(0));
+        BOOST_REQUIRE(!m1_2.find_row(*s, ckey2)->find_cell(1));
+        cmv = m1_2.find_row(*s, ckey2)->find_cell(2)->as_collection_mutation();
         cm = my_set_type->deserialize_mutation_form(cmv);
         BOOST_REQUIRE(cm.cells.size() == 1);
         BOOST_REQUIRE(cm.cells.front().first == int32_type->decompose(2));
@@ -1172,7 +1175,7 @@ SEASTAR_TEST_CASE(test_mutation_upgrade) {
             m.upgrade(s2);
 
             mutation m2(pk, s2);
-            m2.partition().clustered_row(ckey1);
+            m2.partition().clustered_row(*s2, ckey1);
             assert_that(m).is_equal_to(m2);
         }
 

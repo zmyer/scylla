@@ -37,6 +37,8 @@
 #include "range.hh"
 #include "frozen_schema.hh"
 #include "repair/repair.hh"
+#include "digest_algorithm.hh"
+#include "idl/consistency_level.dist.hh"
 #include "idl/tracing.dist.hh"
 #include "idl/result.dist.hh"
 #include "idl/reconcilable_result.dist.hh"
@@ -51,8 +53,10 @@
 #include "idl/read_command.dist.hh"
 #include "idl/range.dist.hh"
 #include "idl/partition_checksum.dist.hh"
+#include "idl/query.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
+#include "idl/consistency_level.dist.impl.hh"
 #include "idl/tracing.dist.impl.hh"
 #include "idl/result.dist.impl.hh"
 #include "idl/reconcilable_result.dist.impl.hh"
@@ -67,8 +71,10 @@
 #include "idl/read_command.dist.impl.hh"
 #include "idl/range.dist.impl.hh"
 #include "idl/partition_checksum.dist.impl.hh"
+#include "idl/query.dist.impl.hh"
 #include "rpc/lz4_compressor.hh"
 #include "rpc/multi_algo_compressor_factory.hh"
+#include "partition_range_compat.hh"
 
 namespace net {
 
@@ -292,9 +298,10 @@ messaging_service::messaging_service(gms::inet_address ip
     _rpc->set_logger([] (const sstring& log) {
             rpc_logger.info("{}", log);
     });
-    register_handler(this, messaging_verb::CLIENT_ID, [] (rpc::client_info& ci, gms::inet_address broadcast_address, uint32_t src_cpu_id) {
+    register_handler(this, messaging_verb::CLIENT_ID, [] (rpc::client_info& ci, gms::inet_address broadcast_address, uint32_t src_cpu_id, rpc::optional<uint64_t> max_result_size) {
         ci.attach_auxiliary("baddr", broadcast_address);
         ci.attach_auxiliary("src_cpu_id", src_cpu_id);
+        ci.attach_auxiliary("max_result_size", max_result_size.value_or(query::result_memory_limiter::maximum_result_size));
         return rpc::no_wait;
     });
 
@@ -381,6 +388,8 @@ static unsigned get_rpc_client_idx(messaging_verb verb) {
                verb == messaging_verb::STREAM_MUTATION_DONE ||
                verb == messaging_verb::COMPLETE_MESSAGE) {
         idx = 2;
+    } else if (verb == messaging_verb::MUTATION_DONE) {
+        idx = 3;
     }
     return idx;
 }
@@ -495,7 +504,8 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
 
     it = _clients[idx].emplace(id, shard_info(std::move(client))).first;
     uint32_t src_cpu_id = engine().cpu_id();
-    _rpc->make_client<rpc::no_wait_type(gms::inet_address, uint32_t)>(messaging_verb::CLIENT_ID)(*it->second.rpc_client, utils::fb_utilities::get_broadcast_address(), src_cpu_id);
+    _rpc->make_client<rpc::no_wait_type(gms::inet_address, uint32_t, uint64_t)>(messaging_verb::CLIENT_ID)(*it->second.rpc_client, utils::fb_utilities::get_broadcast_address(), src_cpu_id,
+                                                                                                           query::result_memory_limiter::maximum_result_size);
     return it->second.rpc_client;
 }
 
@@ -704,10 +714,15 @@ future<> messaging_service::send_stream_mutation(msg_addr id, UUID plan_id, froz
 
 // STREAM_MUTATION_DONE
 void messaging_service::register_stream_mutation_done(std::function<future<> (const rpc::client_info& cinfo,
-        UUID plan_id, std::vector<range<dht::token>> ranges, UUID cf_id, unsigned dst_cpu_id)>&& func) {
-    register_handler(this, messaging_verb::STREAM_MUTATION_DONE, std::move(func));
+        UUID plan_id, dht::token_range_vector ranges, UUID cf_id, unsigned dst_cpu_id)>&& func) {
+    register_handler(this, messaging_verb::STREAM_MUTATION_DONE,
+            [func = std::move(func)] (const rpc::client_info& cinfo,
+                    UUID plan_id, std::vector<wrapping_range<dht::token>> ranges,
+                    UUID cf_id, unsigned dst_cpu_id) mutable {
+        return func(cinfo, plan_id, compat::unwrap(std::move(ranges)), cf_id, dst_cpu_id);
+    });
 }
-future<> messaging_service::send_stream_mutation_done(msg_addr id, UUID plan_id, std::vector<range<dht::token>> ranges, UUID cf_id, unsigned dst_cpu_id) {
+future<> messaging_service::send_stream_mutation_done(msg_addr id, UUID plan_id, dht::token_range_vector ranges, UUID cf_id, unsigned dst_cpu_id) {
     return send_message_timeout_and_retry<void>(this, messaging_verb::STREAM_MUTATION_DONE, id,
         streaming_timeout, streaming_nr_retry, streaming_wait_before_retry,
         plan_id, std::move(ranges), cf_id, dst_cpu_id);
@@ -809,6 +824,16 @@ future<> messaging_service::send_mutation(msg_addr id, clock_type::time_point ti
         std::move(reply_to), std::move(shard), std::move(response_id), std::move(trace_info));
 }
 
+void messaging_service::register_counter_mutation(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, std::vector<frozen_mutation> fms, db::consistency_level cl, stdx::optional<tracing::trace_info> trace_info)>&& func) {
+    register_handler(this, net::messaging_verb::COUNTER_MUTATION, std::move(func));
+}
+void messaging_service::unregister_counter_mutation() {
+    _rpc->unregister_handler(net::messaging_verb::COUNTER_MUTATION);
+}
+future<> messaging_service::send_counter_mutation(msg_addr id, clock_type::time_point timeout, std::vector<frozen_mutation> fms, db::consistency_level cl, stdx::optional<tracing::trace_info> trace_info) {
+    return send_message_timeout<void>(this, messaging_verb::COUNTER_MUTATION, std::move(id), timeout, std::move(fms), cl, std::move(trace_info));
+}
+
 void messaging_service::register_mutation_done(std::function<future<rpc::no_wait_type> (const rpc::client_info& cinfo, unsigned shard, response_id_type response_id)>&& func) {
     register_handler(this, net::messaging_verb::MUTATION_DONE, std::move(func));
 }
@@ -819,14 +844,14 @@ future<> messaging_service::send_mutation_done(msg_addr id, unsigned shard, resp
     return send_message_oneway(this, messaging_verb::MUTATION_DONE, std::move(id), std::move(shard), std::move(response_id));
 }
 
-void messaging_service::register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
+void messaging_service::register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda)>&& func) {
     register_handler(this, net::messaging_verb::READ_DATA, std::move(func));
 }
 void messaging_service::unregister_read_data() {
     _rpc->unregister_handler(net::messaging_verb::READ_DATA);
 }
-future<query::result> messaging_service::send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
-    return send_message_timeout<query::result>(this, messaging_verb::READ_DATA, std::move(id), timeout, cmd, pr);
+future<query::result> messaging_service::send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da) {
+    return send_message_timeout<query::result>(this, messaging_verb::READ_DATA, std::move(id), timeout, cmd, pr, da);
 }
 
 void messaging_service::register_get_schema_version(std::function<future<frozen_schema>(unsigned, table_schema_version)>&& func) {
@@ -849,23 +874,23 @@ future<utils::UUID> messaging_service::send_schema_check(msg_addr dst) {
     return send_message<utils::UUID>(this, net::messaging_verb::SCHEMA_CHECK, dst);
 }
 
-void messaging_service::register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
+void messaging_service::register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr)>&& func) {
     register_handler(this, net::messaging_verb::READ_MUTATION_DATA, std::move(func));
 }
 void messaging_service::unregister_read_mutation_data() {
     _rpc->unregister_handler(net::messaging_verb::READ_MUTATION_DATA);
 }
-future<reconcilable_result> messaging_service::send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+future<reconcilable_result> messaging_service::send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr) {
     return send_message_timeout<reconcilable_result>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), timeout, cmd, pr);
 }
 
-void messaging_service::register_read_digest(std::function<future<query::result_digest, api::timestamp_type> (const rpc::client_info&, query::read_command cmd, query::partition_range pr)>&& func) {
+void messaging_service::register_read_digest(std::function<future<query::result_digest, api::timestamp_type> (const rpc::client_info&, query::read_command cmd, compat::wrapping_partition_range pr)>&& func) {
     register_handler(this, net::messaging_verb::READ_DIGEST, std::move(func));
 }
 void messaging_service::unregister_read_digest() {
     _rpc->unregister_handler(net::messaging_verb::READ_DIGEST);
 }
-future<query::result_digest, rpc::optional<api::timestamp_type>> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const query::partition_range& pr) {
+future<query::result_digest, rpc::optional<api::timestamp_type>> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr) {
     return send_message_timeout<future<query::result_digest, rpc::optional<api::timestamp_type>>>(this, net::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr);
 }
 
@@ -897,14 +922,14 @@ future<> messaging_service::send_replication_finished(msg_addr id, inet_address 
 // Wrapper for REPAIR_CHECKSUM_RANGE
 void messaging_service::register_repair_checksum_range(
         std::function<future<partition_checksum> (sstring keyspace,
-                sstring cf, query::range<dht::token> range, rpc::optional<repair_checksum> hash_version)>&& f) {
+                sstring cf, dht::token_range range, rpc::optional<repair_checksum> hash_version)>&& f) {
     register_handler(this, messaging_verb::REPAIR_CHECKSUM_RANGE, std::move(f));
 }
 void messaging_service::unregister_repair_checksum_range() {
     _rpc->unregister_handler(messaging_verb::REPAIR_CHECKSUM_RANGE);
 }
 future<partition_checksum> messaging_service::send_repair_checksum_range(
-        msg_addr id, sstring keyspace, sstring cf, ::range<dht::token> range, repair_checksum hash_version)
+        msg_addr id, sstring keyspace, sstring cf, ::dht::token_range range, repair_checksum hash_version)
 {
     return send_message<partition_checksum>(this,
             messaging_verb::REPAIR_CHECKSUM_RANGE, std::move(id),

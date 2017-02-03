@@ -27,6 +27,16 @@
 #include "streamed_mutation.hh"
 #include "utils/move.hh"
 
+std::ostream&
+operator<<(std::ostream& os, const clustering_row& row) {
+    return os << "{clustering_row: ck " << row._ck << " t " << row._t << " row_marker " << row._marker << " cells " << row._cells << "}";
+}
+
+std::ostream&
+operator<<(std::ostream& os, const static_row& row) {
+    return os << "{static_row: "<< row._cells << "}";
+}
+
 mutation_fragment::mutation_fragment(static_row&& r)
     : _kind(kind::static_row), _data(std::make_unique<data>())
 {
@@ -71,16 +81,6 @@ const clustering_key_prefix& mutation_fragment::key() const
     return visit(get_key_visitor());
 }
 
-int mutation_fragment::bound_kind_weight() const {
-    assert(has_key());
-    struct get_bound_kind_weight {
-        int operator()(const clustering_row&) { return 0; }
-        int operator()(const range_tombstone& rt) { return weight(rt.start_kind); }
-        int operator()(...) { abort(); }
-    };
-    return visit(get_bound_kind_weight());
-}
-
 void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
 {
     assert(_kind == mf._kind);
@@ -99,16 +99,9 @@ void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
     mf._data.reset();
 }
 
-position_in_partition mutation_fragment::position() const
+position_in_partition_view mutation_fragment::position() const
 {
-    struct get_position {
-        position_in_partition operator()(const static_row& sr) { return sr.position(); }
-        position_in_partition operator()(const clustering_row& cr) { return cr.position(); }
-        position_in_partition operator()(const range_tombstone& rt) {
-            return position_in_partition(position_in_partition::range_tombstone_tag_t(), rt.start_bound());
-        }
-    };
-    return visit(get_position());
+    return visit([] (auto& mf) { return mf.position(); });
 }
 
 std::ostream& operator<<(std::ostream& os, const streamed_mutation& sm) {
@@ -125,6 +118,15 @@ std::ostream& operator<<(std::ostream& os, mutation_fragment::kind k)
     case mutation_fragment::kind::range_tombstone: return os << "range tombstone";
     }
     abort();
+}
+
+std::ostream& operator<<(std::ostream& os, const mutation_fragment& mf) {
+    os << "{mutation_fragment: " << mf._kind << " ";
+    mf.visit([&os] (const auto& what) {
+       os << what;
+    });
+    os << "}";
+    return os;
 }
 
 streamed_mutation streamed_mutation_from_mutation(mutation m)
@@ -153,7 +155,7 @@ streamed_mutation streamed_mutation_from_mutation(mutation m)
             }
         }
         mutation_fragment_opt read_next() {
-            if (_cr && (!_rt || _cmp(*_cr, *_rt))) {
+            if (_cr && (!_rt || _cmp(_cr->position(), _rt->position()))) {
                 auto cr = move_and_disengage(_cr);
                 prepare_next_clustering_row();
                 return cr;
@@ -187,13 +189,17 @@ streamed_mutation streamed_mutation_from_mutation(mutation m)
             , _mutation(std::move(m))
             , _cmp(*_mutation.schema())
         {
+            auto mutation_destroyer = defer([this] { destroy_mutation(); });
+
             prepare_next_clustering_row();
             prepare_next_range_tombstone();
 
             do_fill_buffer();
+
+            mutation_destroyer.cancel();
         }
 
-        ~reader() {
+        void destroy_mutation() noexcept {
             // After unlink_leftmost_without_rebalance() was called on a bi::set
             // we need to complete destroying the tree using that function.
             // clear_and_dispose() used by mutation_partition destructor won't
@@ -212,6 +218,10 @@ streamed_mutation streamed_mutation_from_mutation(mutation m)
                 current_deleter<range_tombstone>()(rt);
                 rt = rts.unlink_leftmost_without_rebalance();
             }
+        }
+
+        ~reader() {
+            destroy_mutation();
         }
 
         virtual future<> fill_buffer() override {
@@ -236,12 +246,17 @@ class mutation_merger final : public streamed_mutation::impl {
 private:
     void read_next() {
         if (_readers.empty()) {
-            _end_of_stream = true;
+            auto rt = _deferred_tombstones.get_next();
+            if (rt) {
+                push_mutation_fragment(std::move(*rt));
+            } else {
+                _end_of_stream = true;
+            }
             return;
         }
 
         position_in_partition::less_compare cmp(*_schema);
-        auto heap_compare = [&] (auto& a, auto& b) { return cmp(b.row, a.row); };
+        auto heap_compare = [&] (auto& a, auto& b) { return cmp(b.row.position(), a.row.position()); };
 
         auto result = [&] {
             auto rt = _deferred_tombstones.get_next(_readers.front().row);
@@ -256,7 +271,7 @@ private:
         }();
 
         while (!_readers.empty()) {
-            if (cmp(result, _readers.front().row)) {
+            if (cmp(result.position(), _readers.front().row.position())) {
                 break;
             }
             boost::range::pop_heap(_readers, heap_compare);
@@ -277,7 +292,7 @@ private:
 
     void do_fill_buffer() {
         position_in_partition::less_compare cmp(*_schema);
-        auto heap_compare = [&] (auto& a, auto& b) { return cmp(b.row, a.row); };
+        auto heap_compare = [&] (auto& a, auto& b) { return cmp(b.row.position(), a.row.position()); };
 
         for (auto& rd : _next_readers) {
             if (rd->is_buffer_empty()) {
@@ -311,9 +326,6 @@ private:
     }
 protected:
     virtual future<> fill_buffer() override  {
-        if (_next_readers.empty()) {
-            return make_ready_future<>();
-        }
         while (!is_end_of_stream() && !is_buffer_full()) {
             std::vector<future<>> more_data;
             for (auto& rd : _next_readers) {
@@ -360,7 +372,8 @@ mutation_fragment_opt range_tombstone_stream::do_get_next()
 mutation_fragment_opt range_tombstone_stream::get_next(const rows_entry& re)
 {
     if (!_list.empty()) {
-        return !_cmp(re, _list.begin()->start_bound()) ? do_get_next() : mutation_fragment_opt();
+        position_in_partition_view view(position_in_partition_view::clustering_row_tag_t(), re.key());
+        return !_cmp(view, _list.begin()->position()) ? do_get_next() : mutation_fragment_opt();
     }
     return { };
 }
@@ -368,7 +381,7 @@ mutation_fragment_opt range_tombstone_stream::get_next(const rows_entry& re)
 mutation_fragment_opt range_tombstone_stream::get_next(const mutation_fragment& mf)
 {
     if (!_list.empty()) {
-        return !_cmp(mf, *_list.begin()) ? do_get_next() : mutation_fragment_opt();
+        return !_cmp(mf.position(), _list.begin()->position()) ? do_get_next() : mutation_fragment_opt();
     }
     return { };
 }

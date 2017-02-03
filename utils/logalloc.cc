@@ -32,6 +32,7 @@
 #include <seastar/core/memory.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/print.hh>
+#include <seastar/core/metrics.hh>
 
 #include "utils/logalloc.hh"
 #include "log.hh"
@@ -53,7 +54,7 @@ using clock = std::chrono::steady_clock;
 
 class tracker::impl {
     std::vector<region::impl*> _regions;
-    scollectd::registrations _collectd_registrations;
+    seastar::metrics::metric_groups _metrics;
     bool _reclaiming_enabled = true;
     size_t _reclamation_step = 1;
     bool _abort_on_bad_alloc = false;
@@ -74,12 +75,9 @@ private:
             _ref._reclaiming_enabled = _prev;
         }
     };
-    void register_collectd_metrics();
     friend class tracker_reclaimer_lock;
 public:
-    impl() {
-        register_collectd_metrics();
-    }
+    impl();
     ~impl();
     void register_region(region::impl*);
     void unregister_region(region::impl*);
@@ -350,7 +348,10 @@ private:
     bool migrate_segment(size_t from, size_t to);
     size_t shrink_by(size_t delta);
 public:
-    segment_zone();
+    segment_zone(segment* base, size_t size) : _base(base) {
+        _segments.resize(size, true);
+    }
+    static std::unique_ptr<segment_zone> try_creating_zone();
     ~segment_zone() {
         assert(empty());
         if (_segments.size()) {
@@ -404,8 +405,9 @@ public:
 thread_local size_t segment_zone::next_attempt_size = segment_zone::initial_size;
 constexpr size_t segment_zone::minimum_size;
 
-segment_zone::segment_zone()
+std::unique_ptr<segment_zone> segment_zone::try_creating_zone()
 {
+    std::unique_ptr<segment_zone> zone;
     auto next_size = next_attempt_size;
     while (next_size) {
         auto size = next_size;
@@ -414,27 +416,27 @@ segment_zone::segment_zone()
         if (!can_allocate_more_memory(size << segment::size_shift)) {
             continue;
         }
+        memory::disable_abort_on_alloc_failure_temporarily no_abort_guard;
         auto ptr = aligned_alloc(segment::size, size << segment::size_shift);
         if (!ptr) {
             continue;
         }
-        _base = static_cast<segment*>(ptr);
         try {
-            _segments.resize(size, true);
-            logger.debug("Creating new zone @{}, size: {}", this, size);
+            zone = std::make_unique<segment_zone>(static_cast<segment*>(ptr), size);
+            logger.debug("Creating new zone @{}, size: {}", zone.get(), size);
             next_attempt_size = std::max(size << 1, minimum_size);
             while (size--) {
-                auto seg = segment_from_position(size);
-                _free_segments.push_front(*new (seg) free_segment);
+                auto seg = zone->segment_from_position(size);
+                zone->_free_segments.push_front(*new (seg) free_segment);
             }
-            return;
+            return zone;
         } catch (const std::bad_alloc&) {
-            free(_base);
+            free(ptr);
         }
     }
-    logger.trace("Failed to create zone @{}", this);
+    logger.trace("Failed to create zone");
     next_attempt_size = minimum_size;
-    throw std::bad_alloc();
+    return zone;
 }
 
 struct segment_zone_base_address_compare {
@@ -517,7 +519,7 @@ public:
     segment* new_segment(region::impl* r);
     segment_descriptor& descriptor(const segment*);
     // Returns segment containing given object or nullptr.
-    segment* containing_segment(void* obj) const;
+    segment* containing_segment(const void* obj) const;
     void free_segment(segment*) noexcept;
     void free_segment(segment*, segment_descriptor&) noexcept;
     size_t segments_in_use() const;
@@ -660,7 +662,10 @@ segment* segment_pool::allocate_segment()
         if (can_allocate_more_memory(segment::size)) {
             segment_zone* zone;
             try {
-                zone = new segment_zone;
+                zone = segment_zone::try_creating_zone().release();
+                if (!zone) {
+                    continue;
+                }
             } catch (const std::bad_alloc&) {
                 continue;
             }
@@ -720,7 +725,7 @@ segment_pool::descriptor(const segment* seg) {
 }
 
 segment*
-segment_pool::containing_segment(void* obj) const {
+segment_pool::containing_segment(const void* obj) const {
     auto addr = reinterpret_cast<uintptr_t>(obj);
     auto offset = addr & (segment::size - 1);
     auto index = (addr - _segments_base) >> segment::size_shift;
@@ -830,7 +835,7 @@ public:
         _segments.erase(i);
         ::free(seg);
     }
-    segment* containing_segment(void* obj) const {
+    segment* containing_segment(const void* obj) const {
         uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
         auto seg = reinterpret_cast<segment*>(align_down(addr, static_cast<uintptr_t>(segment::size)));
         auto i = _segments.find(seg);
@@ -1295,6 +1300,10 @@ public:
         return total;
     }
 
+    region_group* group() {
+        return _group;
+    }
+
     occupancy_stats compactible_occupancy() const {
         return _closed_occupancy;
     }
@@ -1377,6 +1386,17 @@ public:
             } else {
                 _closed_occupancy += seg_desc.occupancy();
             }
+        }
+    }
+
+    virtual size_t object_memory_size_in_allocator(const void* obj) const noexcept override {
+        segment* seg = shard_segment_pool.containing_segment(obj);
+
+        if (!seg) {
+            return standard_allocator().object_memory_size_in_allocator(obj);
+        } else {
+            auto desc = reinterpret_cast<object_descriptor*>(reinterpret_cast<uintptr_t>(obj) - sizeof(object_descriptor));
+            return sizeof(object_descriptor) + desc->size();
         }
     }
 
@@ -1611,6 +1631,10 @@ occupancy_stats region::occupancy() const {
     return _impl->occupancy();
 }
 
+region_group* region::group() {
+    return _impl->group();
+}
+
 void region::merge(region& other) {
     if (_impl != other._impl) {
         _impl->merge(*other._impl);
@@ -1620,6 +1644,13 @@ void region::merge(region& other) {
 
 void region::full_compaction() {
     _impl->full_compaction();
+}
+
+memory::reclaiming_result region::evict_some() {
+    if (_impl->is_evictable()) {
+        return _impl->evict_some();
+    }
+    return memory::reclaiming_result::reclaimed_nothing;
 }
 
 void region::make_evictable(eviction_fn fn) {
@@ -1680,7 +1711,7 @@ void tracker::impl::full_compaction() {
     logger.debug("Full compaction on all regions, {}", region_occupancy());
 
     for (region_impl* r : _regions) {
-        if (r->is_compactible()) {
+        if (r->reclaiming_enabled()) {
             r->full_compaction();
         }
     }
@@ -1977,54 +2008,45 @@ void tracker::impl::unregister_region(region::impl* r) {
     _regions.erase(std::remove(_regions.begin(), _regions.end(), r));
 }
 
-void tracker::impl::register_collectd_metrics() {
-    _collectd_registrations = scollectd::registrations({
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "total_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return region_occupancy().total_space(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "used_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return region_occupancy().used_space(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "small_objects_total_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return region_occupancy().total_space() - shard_segment_pool.non_lsa_memory_in_use(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "small_objects_used_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return region_occupancy().used_space() - shard_segment_pool.non_lsa_memory_in_use(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "large_objects_total_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [] { return shard_segment_pool.non_lsa_memory_in_use(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "non_lsa_used_space"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] {
+tracker::impl::impl() {
+    namespace sm = seastar::metrics;
+
+    _metrics.add_group("lsa", {
+        sm::make_gauge("total_space_bytes", [this] { return region_occupancy().total_space(); },
+                       sm::description("Holds a current size of allocated memory in bytes.")),
+
+        sm::make_gauge("used_space_bytes", [this] { return region_occupancy().used_space(); },
+                       sm::description("Holds a current amount of used memory in bytes.")),
+
+        sm::make_gauge("small_objects_total_space_bytes", [this] { return region_occupancy().total_space() - shard_segment_pool.non_lsa_memory_in_use(); },
+                       sm::description("Holds a current size of \"small objects\" memory region in bytes.")),
+
+        sm::make_gauge("small_objects_used_space_bytes", [this] { return region_occupancy().used_space() - shard_segment_pool.non_lsa_memory_in_use(); },
+                       sm::description("Holds a current amount of used \"small objects\" memory in bytes.")),
+
+        sm::make_gauge("large_objects_total_space_bytes", [this] { return shard_segment_pool.non_lsa_memory_in_use(); },
+                       sm::description("Holds a current size of allocated non-LSA memory.")),
+
+        sm::make_gauge("non_lsa_used_space_bytes",
+            [this] {
                 auto free_space_in_zones = shard_segment_pool.free_segments_in_zones() * segment_size;
-                return memory::stats().allocated_memory() - region_occupancy().total_space() - free_space_in_zones; })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "bytes", "free_space_in_zones"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [] { return shard_segment_pool.free_segments_in_zones() * segment_size; })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "percent", "occupancy"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [this] { return region_occupancy().used_fraction() * 100; })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "objects", "zones"),
-            scollectd::make_typed(scollectd::data_type::GAUGE, [] { return shard_segment_pool.zone_count(); })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "operations", "segments_migrated"),
-            scollectd::make_typed(scollectd::data_type::DERIVE, [] { return shard_segment_pool.statistics().segments_migrated; })
-        ),
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("lsa", scollectd::per_cpu_plugin_instance, "operations", "segments_compacted"),
-            scollectd::make_typed(scollectd::data_type::DERIVE, [] { return shard_segment_pool.statistics().segments_compacted; })
-        ),
+                return memory::stats().allocated_memory() - region_occupancy().total_space() - free_space_in_zones;
+            }, sm::description("Holds a current amount of used non-LSA memory.")),
+
+        sm::make_gauge("free_space_in_zones", [this] { return shard_segment_pool.free_segments_in_zones() * segment_size; },
+                       sm::description("Holds a current amount of free memory in zones.")),
+
+        sm::make_gauge("occupancy", [this] { return region_occupancy().used_fraction() * 100; },
+                       sm::description("Holds a current portion (in percents) of the used memory.")),
+
+        sm::make_gauge("zones", [this] { return shard_segment_pool.zone_count(); },
+                       sm::description("Holds a current number of zones.")),
+
+        sm::make_derive("segments_migrated", [this] { return shard_segment_pool.statistics().segments_migrated; },
+                        sm::description("Counts a number of migrated segments.")),
+
+        sm::make_derive("segments_compacted", [this] { return shard_segment_pool.statistics().segments_compacted; },
+                        sm::description("Counts a number of compacted segments.")),
     });
 }
 
@@ -2041,56 +2063,6 @@ region_group_reclaimer region_group::no_reclaimer;
 
 uint64_t region_group::top_region_evictable_space() const {
     return _regions.empty() ? 0 : _regions.top()->evictable_occupancy().total_space();
-}
-
-void region_group::release_requests() noexcept {
-    // The later() statement is here  to avoid executing the function in update() context. But
-    // also guarantees that we won't dominate the CPU if we have many requests to release.
-    //
-    // However, both with_gate() and later() can ultimately call to schedule() and consequently
-    // allocate memory, which (if that allocation triggers a compaction - that frees memory) would
-    // defeat the very purpose of not executing this on update() context. Allocations should be rare
-    // on those but can happen, so we need to at least make sure they will not reclaim.
-    //
-    // Whatever comes after later() is already in a safe context, so we don't need to keep the lock
-    // alive until we are done with the whole execution - only until later is successfully executed.
-    tracker_reclaimer_lock rl;
-
-    _reclaimer.notify_relief();
-    if (_descendant_blocked_requests) {
-        _descendant_blocked_requests->set_value();
-    }
-    _descendant_blocked_requests = {};
-
-    if (_blocked_requests.empty()) {
-        return;
-    }
-
-    with_gate(_asynchronous_gate, [this, rl = std::move(rl)] () mutable {
-        return later().then([this] {
-            // Check again, we may have executed release_requests() in this mean time from another entry
-            // point (for instance, a descendant notification)
-            if (_blocked_requests.empty()) {
-                return;
-            }
-
-            auto blocked_at = do_for_each_parent(this, [] (auto rg) {
-                return rg->execution_permitted() ? stop_iteration::no : stop_iteration::yes;
-            });
-
-            if (!blocked_at) {
-                auto req = std::move(_blocked_requests.front());
-                _blocked_requests.pop_front();
-                req->allocate();
-                release_requests();
-            } else {
-                // If someone blocked us in the mean time then we can't execute. We need to make
-                // sure that we are listening to notifications, though. It could be that we used to
-                // be blocked on ourselves and now we are blocking on an ancestor
-                subscribe_for_ancestor_available_memory_notification(blocked_at);
-            }
-        });
-    });
 }
 
 region* region_group::get_largest_region() {
@@ -2124,6 +2096,88 @@ region_group::del(region_impl* child) {
     _regions.erase(child->_heap_handle);
     region_group_binomial_group_sanity_check(_regions);
     update(-child->occupancy().total_space());
+}
+
+bool
+region_group::execution_permitted() noexcept {
+    return do_for_each_parent(this, [] (auto rg) {
+        return rg->under_pressure() ? stop_iteration::yes : stop_iteration::no;
+    }) == nullptr;
+}
+
+future<>
+region_group::start_releaser() {
+    return later().then([this] {
+        return repeat([this] () noexcept {
+            if (_shutdown_requested) {
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+
+            if (!_blocked_requests.empty() && execution_permitted()) {
+                auto req = std::move(_blocked_requests.front());
+                _blocked_requests.pop_front();
+                req->allocate();
+                return make_ready_future<stop_iteration>(stop_iteration::no);
+            } else {
+                // Block reclaiming to prevent signal() from being called by reclaimer inside wait()
+                // FIXME: handle allocation failures (not very likely) like allocating_section does
+                tracker_reclaimer_lock rl;
+                return _relief.wait().then([] {
+                    return stop_iteration::no;
+                });
+            }
+        });
+    });
+}
+
+region_group::region_group(region_group *parent, region_group_reclaimer& reclaimer)
+    : _parent(parent)
+    , _reclaimer(reclaimer)
+    , _releaser(reclaimer_can_block() ? start_releaser() : make_ready_future<>())
+{
+    if (_parent) {
+        _parent->add(this);
+    }
+}
+
+bool region_group::reclaimer_can_block() const {
+    return _reclaimer.throttle_threshold() != std::numeric_limits<size_t>::max();
+}
+
+void region_group::notify_relief() {
+    _relief.signal();
+    for (region_group* child : _subgroups) {
+        child->notify_relief();
+    }
+}
+
+void region_group::update(ssize_t delta) {
+    // Most-enclosing group which was relieved.
+    region_group* top_relief = nullptr;
+
+    do_for_each_parent(this, [&top_relief, delta] (region_group* rg) mutable {
+        rg->update_maximal_rg();
+        rg->_total_memory += delta;
+
+        if (rg->_total_memory >= rg->_reclaimer.soft_limit_threshold()) {
+            rg->_reclaimer.notify_soft_pressure();
+        } else {
+            rg->_reclaimer.notify_soft_relief();
+        }
+
+        if (rg->_total_memory > rg->_reclaimer.throttle_threshold()) {
+            rg->_reclaimer.notify_pressure();
+        } else if (rg->_reclaimer.under_pressure()) {
+            rg->_reclaimer.notify_relief();
+            top_relief = rg;
+        }
+
+        return stop_iteration::no;
+    });
+
+    if (top_relief) {
+        top_relief->notify_relief();
+    }
 }
 
 allocating_section::guard::guard()
@@ -2173,5 +2227,9 @@ void allocating_section::on_alloc_failure() {
 }
 
 #endif
+
+void region_group::on_request_expiry::operator()(std::unique_ptr<allocating_function>& func) noexcept {
+    func->fail(std::make_exception_ptr(timed_out_error()));
+}
 
 }

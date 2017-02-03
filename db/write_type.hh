@@ -41,6 +41,7 @@
 #pragma once
 
 #include <assert.h>
+#include <cstdint>
 
 namespace db {
 
@@ -53,19 +54,7 @@ enum class write_type : uint8_t {
     CAS,
 };
 
-inline std::ostream& operator<<(std::ostream& os, const write_type& t) {
-    switch(t) {
-        case write_type::SIMPLE: os << "SIMPLE"; break;
-        case write_type::BATCH: os << "BATCH"; break;
-        case write_type::UNLOGGED_BATCH: os << "UNLOGGED_BATCH"; break;
-        case write_type::COUNTER: os << "COUNTER"; break;
-        case write_type::BATCH_LOG: os << "BATCH_LOG"; break;
-        case write_type::CAS: os << "CAS"; break;
-        default:
-            assert(false);
-    }
-    return os;
-}
+std::ostream& operator<<(std::ostream& os, const write_type& t);
 
 }
 

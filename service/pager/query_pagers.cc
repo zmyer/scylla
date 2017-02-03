@@ -53,8 +53,8 @@ public:
                     service::query_state& state,
                     const cql3::query_options& options,
                     lw_shared_ptr<query::read_command> cmd,
-                    std::vector<query::partition_range> ranges)
-                    : _has_clustering_keys(s->clustering_key_size() > 0)
+                    dht::partition_range_vector ranges)
+                    : _has_clustering_keys(has_clustering_keys(*s, *cmd))
                     , _max(cmd->row_limit)
                     , _schema(std::move(s))
                     , _selection(selection)
@@ -64,8 +64,13 @@ public:
                     , _ranges(std::move(ranges))
     {}
 
-private:   
-    future<> fetch_page(cql3::selection::result_set_builder& builder, uint32_t page_size, db_clock::time_point now) override {
+private:
+    static bool has_clustering_keys(const schema& s, const query::read_command& cmd) {
+        return s.clustering_key_size() > 0
+               && !cmd.slice.options.contains<query::partition_slice::option::distinct>();
+    }
+
+    future<> fetch_page(cql3::selection::result_set_builder& builder, uint32_t page_size, gc_clock::time_point now) override {
         auto state = _options.get_paging_state();
 
         if (!_last_pkey && state) {
@@ -103,7 +108,9 @@ private:
                     }
 
                     bool remove = !found
-                            || (contains && (i->is_singular() && !inclusive))
+                            || (contains && !inclusive && (i->is_singular()
+                                || (reversed && i->start() && !cmp(i->start()->value(), lo))
+                                || (!reversed && i->end() && !cmp(i->end()->value(), lo))))
                             ;
 
                     if (remove) {
@@ -204,7 +211,7 @@ private:
     }
 
     future<std::unique_ptr<cql3::result_set>> fetch_page(uint32_t page_size,
-            db_clock::time_point now) override {
+            gc_clock::time_point now) override {
         return do_with(
                 cql3::selection::result_set_builder(*_selection, now,
                         _options.get_cql_serialization_format()),
@@ -218,99 +225,46 @@ private:
     void handle_result(
             cql3::selection::result_set_builder& builder,
             foreign_ptr<lw_shared_ptr<query::result>> results,
-            uint32_t page_size, db_clock::time_point now) {
+            uint32_t page_size, gc_clock::time_point now) {
 
         class myvisitor : public cql3::selection::result_set_builder::visitor {
         public:
-            impl& _impl;
-            uint32_t page_size;
-            uint32_t part_rows = 0;
-
-            uint32_t included_rows = 0;
             uint32_t total_rows = 0;
             std::experimental::optional<partition_key> last_pkey;
             std::experimental::optional<clustering_key> last_ckey;
 
-            // just for verbosity
-            uint32_t part_ignored = 0;
-
-            clustering_key::less_compare _less;
-
-            bool include_row() {
-                ++total_rows;
-                ++part_rows;
-                if (included_rows >= page_size) {
-                    ++part_ignored;
-                    return false;
-                }
-                ++included_rows;
-                return true;
-            }
-
-            bool include_row(const clustering_key& key) {
-                if (!include_row()) {
-                    return false;
-                }
-                if (included_rows == page_size) {
-                    last_ckey = key;
-                }
-                return true;
-            }
-            myvisitor(impl& i, uint32_t ps,
-                    cql3::selection::result_set_builder& builder,
+            myvisitor(cql3::selection::result_set_builder& builder,
                     const schema& s,
                     const cql3::selection::selection& selection)
-                    : visitor(builder, s, selection), _impl(i), page_size(ps), _less(*_impl._schema) {
+                    : visitor(builder, s, selection) {
             }
 
             void accept_new_partition(uint32_t) {
                 throw std::logic_error("Should not reach!");
             }
             void accept_new_partition(const partition_key& key, uint32_t row_count) {
-                logger.trace("Begin partition: {} ({})", key, row_count);
-                part_rows = 0;
-                part_ignored = 0;
-                if (included_rows < page_size) {
-                    last_pkey = key;
-                }
+                logger.trace("Accepting partition: {} ({})", key, row_count);
+                total_rows += row_count;
+                last_pkey = key;
+                last_ckey = { };
                 visitor::accept_new_partition(key, row_count);
             }
             void accept_new_row(const clustering_key& key,
                     const query::result_row_view& static_row,
                     const query::result_row_view& row) {
-                // TODO: should we use exception/long jump or introduce
-                // a "stop" condition to the calling result_view and
-                // avoid processing unneeded rows?
-                auto ok = include_row(key);
-                if (ok) {
-                    visitor::accept_new_row(key, static_row, row);
-                }
+                last_ckey = key;
+                visitor::accept_new_row(key, static_row, row);
             }
             void accept_new_row(const query::result_row_view& static_row,
                     const query::result_row_view& row) {
-                auto ok = include_row();
-                if (ok) {
-                    visitor::accept_new_row(static_row, row);
-                }
+                visitor::accept_new_row(static_row, row);
             }
             void accept_partition_end(const query::result_row_view& static_row) {
-                // accept_partition_end with row_count == 0
-                // means we had an empty partition but live
-                // static columns, and since the fix,
-                // no CK restrictions.
-                // I.e. _row_count == 0 -> add a partially empty row
-                // So, treat this case as an accept_row variant
-                if (_row_count > 0 || include_row()) {
-                    visitor::accept_partition_end(static_row);
-                }
-                logger.trace(
-                        "End partition, included={}, ignored={}",
-                        part_rows - part_ignored,
-                        part_ignored);
+                visitor::accept_partition_end(static_row);
             }
         };
 
-        myvisitor v(*this, std::min(page_size, _max), builder, *_schema, *_selection);
+        myvisitor v(builder, *_schema, *_selection);
         query::result_view::consume(*results, _cmd->slice, v);
 
         if (_last_pkey) {
@@ -322,13 +276,12 @@ private:
             _cmd->slice.clear_range(*_schema, *_last_pkey);
         }
 
-        _max = _max - v.included_rows;
-        _exhausted = v.included_rows < page_size || _max == 0;
+        _max = _max - v.total_rows;
+        _exhausted = (v.total_rows < page_size && !results->is_short_read()) || _max == 0;
         _last_pkey = v.last_pkey;
         _last_ckey = v.last_ckey;
 
-        logger.debug("Fetched {}/{} rows, max_remain={} {}", v.included_rows, v.total_rows,
-                _max, _exhausted ? "(exh)" : "");
+        logger.debug("Fetched {} rows, max_remain={} {}", v.total_rows, _max, _exhausted ? "(exh)" : "");
 
         if (_last_pkey) {
             logger.debug("Last partition key: {}", *_last_pkey);
@@ -357,7 +310,6 @@ private:
     // remember if we use clustering. if not, each partition == one row
     const bool _has_clustering_keys;
     bool _exhausted = false;
-    uint32_t _rem = 0;
     uint32_t _max;
 
     std::experimental::optional<partition_key> _last_pkey;
@@ -368,12 +320,12 @@ private:
     service::query_state& _state;
     const cql3::query_options& _options;
     lw_shared_ptr<query::read_command> _cmd;
-    std::vector<query::partition_range> _ranges;
+    dht::partition_range_vector _ranges;
 };
 
 bool service::pager::query_pagers::may_need_paging(uint32_t page_size,
         const query::read_command& cmd,
-        const std::vector<query::partition_range>& ranges) {
+        const dht::partition_range_vector& ranges) {
     auto est_max_rows =
             [&] {
                 if (ranges.empty()) {
@@ -404,7 +356,7 @@ bool service::pager::query_pagers::may_need_paging(uint32_t page_size,
         schema_ptr s, ::shared_ptr<cql3::selection::selection> selection,
         service::query_state& state, const cql3::query_options& options,
         lw_shared_ptr<query::read_command> cmd,
-        std::vector<query::partition_range> ranges) {
+        dht::partition_range_vector ranges) {
     return ::make_shared<impl>(std::move(s), std::move(selection), state,
             options, std::move(cmd), std::move(ranges));
 }

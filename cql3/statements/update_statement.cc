@@ -50,8 +50,8 @@ namespace cql3 {
 
 namespace statements {
 
-update_statement::update_statement(statement_type type, uint32_t bound_terms, schema_ptr s, std::unique_ptr<attributes> attrs)
-    : modification_statement{type, bound_terms, std::move(s), std::move(attrs)}
+update_statement::update_statement(statement_type type, uint32_t bound_terms, schema_ptr s, std::unique_ptr<attributes> attrs, uint64_t* cql_stats_counter_ptr)
+    : modification_statement{type, bound_terms, std::move(s), std::move(attrs), cql_stats_counter_ptr}
 { }
 
 bool update_statement::require_full_clustering_key() const {
@@ -69,7 +69,7 @@ void update_statement::add_update_for_key(mutation& m, const exploded_clustering
         if (s->regular_begin()->name().empty()) {
             // There is no column outside the PK. So no operation could have passed through validation
             assert(_column_operations.empty());
-            constants::setter(*s->regular_begin(), make_shared(constants::value(bytes()))).execute(m, prefix, params);
+            constants::setter(*s->regular_begin(), make_shared(constants::value(cql3::raw_value::make_value(bytes())))).execute(m, prefix, params);
         } else {
             // dense means we don't have a row marker, so don't accept to set only the PK. See CASSANDRA-5648.
             if (_column_operations.empty()) {
@@ -81,7 +81,7 @@ void update_statement::add_update_for_key(mutation& m, const exploded_clustering
         // case empty prefix can only refer to the static row.
         bool is_static_prefix = s->has_static_columns() && !prefix;
         if (type == statement_type::INSERT && !is_static_prefix && s->is_cql3_table()) {
-            auto& row = m.partition().clustered_row(clustering_key::from_clustering_prefix(*s, prefix));
+            auto& row = m.partition().clustered_row(*s, clustering_key::from_clustering_prefix(*s, prefix));
             row.apply(row_marker(params.timestamp(), params.ttl(), params.expiry()));
         }
     }
@@ -124,10 +124,10 @@ insert_statement::insert_statement(            ::shared_ptr<cf_name> name,
 
 ::shared_ptr<cql3::statements::modification_statement>
 insert_statement::prepare_internal(database& db, schema_ptr schema,
-    ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs)
+    ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats)
 {
     using statement_type = cql3::statements::modification_statement::statement_type;
-    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::INSERT, bound_names->size(), schema, std::move(attrs));
+    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::INSERT, bound_names->size(), schema, std::move(attrs), &stats.inserts);
 
     // Created from an INSERT
     if (stmt->is_counter()) {
@@ -181,10 +181,10 @@ update_statement::update_statement(            ::shared_ptr<cf_name> name,
 
 ::shared_ptr<cql3::statements::modification_statement>
 update_statement::prepare_internal(database& db, schema_ptr schema,
-    ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs)
+    ::shared_ptr<variable_specifications> bound_names, std::unique_ptr<attributes> attrs, cql_stats& stats)
 {
     using statement_type = cql3::statements::modification_statement::statement_type;
-    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::UPDATE, bound_names->size(), schema, std::move(attrs));
+    auto stmt = ::make_shared<cql3::statements::update_statement>(statement_type::UPDATE, bound_names->size(), schema, std::move(attrs), &stats.updates);
 
     for (auto&& entry : _updates) {
         auto id = entry.first->prepare_column_identifier(schema);

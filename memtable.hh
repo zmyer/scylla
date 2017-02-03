@@ -61,6 +61,10 @@ public:
     schema_ptr& schema() { return _schema; }
     streamed_mutation read(lw_shared_ptr<memtable> mtbl, const schema_ptr&, const query::partition_slice&);
 
+    size_t external_memory_usage_without_rows() const {
+        return _key.key().external_memory_usage();
+    }
+
     struct compare {
         dht::decorated_key::less_comparator _c;
 
@@ -90,6 +94,8 @@ public:
     };
 };
 
+class dirty_memory_manager;
+
 // Managed by lw_shared_ptr<>.
 class memtable final : public enable_lw_shared_from_this<memtable>, private logalloc::region {
 public:
@@ -97,23 +103,37 @@ public:
         bi::member_hook<memtable_entry, bi::set_member_hook<>, &memtable_entry::_link>,
         bi::compare<memtable_entry::compare>>;
 private:
+    dirty_memory_manager& _dirty_mgr;
+    memtable_list *_memtable_list;
     schema_ptr _schema;
     logalloc::allocating_section _read_section;
     logalloc::allocating_section _allocating_section;
     partitions_type partitions;
     db::replay_position _replay_position;
     lw_shared_ptr<sstables::sstable> _sstable;
+    uint64_t _flushed_memory = 0;
     void update(const db::replay_position&);
     friend class row_cache;
     friend class memtable_entry;
+    friend class flush_reader;
+    friend class flush_memory_accounter;
 private:
-    boost::iterator_range<partitions_type::const_iterator> slice(const query::partition_range& r) const;
+    boost::iterator_range<partitions_type::const_iterator> slice(const dht::partition_range& r) const;
     partition_entry& find_or_create_partition(const dht::decorated_key& key);
     partition_entry& find_or_create_partition_slow(partition_key_view key);
     void upgrade_entry(memtable_entry&);
+    void add_flushed_memory(uint64_t);
+    void remove_flushed_memory(uint64_t);
+    void clear() noexcept;
+    uint64_t dirty_size() const;
 public:
-    explicit memtable(schema_ptr schema, logalloc::region_group* dirty_memory_region_group = nullptr);
+    explicit memtable(schema_ptr schema, dirty_memory_manager&, memtable_list *memtable_list = nullptr);
+    // Used for testing that want to control the flush process.
+    explicit memtable(schema_ptr schema);
     ~memtable();
+    // Clears this memtable gradually without consuming the whole CPU.
+    // Never resolves with a failed future.
+    future<> clear_gently() noexcept;
     schema_ptr schema() const { return _schema; }
     void set_schema(schema_ptr) noexcept;
     future<> apply(memtable&);
@@ -130,7 +150,15 @@ public:
     const logalloc::region& region() const {
         return *this;
     }
+
+    logalloc::region_group* region_group() {
+        return group();
+    }
 public:
+    memtable_list* get_memtable_list() {
+        return _memtable_list;
+    }
+
     size_t partition_count() const;
     logalloc::occupancy_stats occupancy() const;
 
@@ -143,20 +171,24 @@ public:
     //
     // Mutations returned by the reader will all have given schema.
     mutation_reader make_reader(schema_ptr,
-                                const query::partition_range& range = query::full_partition_range,
+                                const dht::partition_range& range = query::full_partition_range,
                                 const query::partition_slice& slice = query::full_slice,
                                 const io_priority_class& pc = default_priority_class());
 
+
+    mutation_reader make_flush_reader(schema_ptr, const io_priority_class& pc);
+
     mutation_source as_data_source();
-    key_source as_key_source();
 
     bool empty() const { return partitions.empty(); }
     void mark_flushed(lw_shared_ptr<sstables::sstable> sst);
     bool is_flushed() const;
+    void on_detach_from_region_group() noexcept;
+    void revert_flushed_memory() noexcept;
 
     const db::replay_position& replay_position() const {
         return _replay_position;
     }
 
-    friend class scanning_reader;
+    friend class iterator_reader;
 };

@@ -30,12 +30,22 @@ namespace query {
 // Implements @Reducer concept from distributed.hh
 class result_merger {
     std::vector<foreign_ptr<lw_shared_ptr<query::result>>> _partial;
+    const uint32_t _max_rows;
+    const uint32_t _max_partitions;
 public:
+    explicit result_merger(uint32_t max_rows, uint32_t max_partitions)
+            : _max_rows(max_rows)
+            , _max_partitions(max_partitions)
+    { }
+
     void reserve(size_t size) {
         _partial.reserve(size);
     }
 
     void operator()(foreign_ptr<lw_shared_ptr<query::result>> r) {
+        if (!_partial.empty() && _partial.back()->is_short_read()) {
+            return;
+        }
         _partial.emplace_back(std::move(r));
     }
 

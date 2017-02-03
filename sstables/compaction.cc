@@ -46,6 +46,7 @@
 
 #include <boost/range/algorithm.hpp>
 #include <boost/range/adaptors.hpp>
+#include <boost/range/join.hpp>
 
 #include "core/future-util.hh"
 #include "core/pipe.hh"
@@ -84,19 +85,25 @@ public:
     }
 };
 
-static api::timestamp_type get_max_purgeable_timestamp(schema_ptr schema,
-    const std::vector<shared_sstable>& not_compacted_sstables, const dht::decorated_key& dk)
-{
+static api::timestamp_type get_max_purgeable_timestamp(const column_family& cf, sstable_set::incremental_selector& selector,
+        const std::unordered_set<shared_sstable>& compacting_set, const dht::decorated_key& dk) {
     auto timestamp = api::max_timestamp;
-    for (auto&& sst : not_compacted_sstables) {
-        if (sst->filter_has_key(*schema, dk.key())) {
+    stdx::optional<utils::hashed_key> hk;
+    for (auto&& sst : boost::range::join(selector.select(dk.token()), cf.compacted_undeleted_sstables())) {
+        if (compacting_set.count(sst)) {
+            continue;
+        }
+        if (!hk) {
+            hk = sstables::sstable::make_hashed_key(*cf.schema(), dk.key());
+        }
+        if (sst->filter_has_key(*hk)) {
             timestamp = std::min(timestamp, sst->get_stats_metadata().min_timestamp);
         }
     }
     return timestamp;
 }
 
-static bool belongs_to_current_node(const dht::token& t, const std::vector<range<dht::token>>& sorted_owned_ranges) {
+static bool belongs_to_current_node(const dht::token& t, const dht::token_range_vector& sorted_owned_ranges) {
     auto low = std::lower_bound(sorted_owned_ranges.begin(), sorted_owned_ranges.end(), t,
             [] (const range<dht::token>& a, const dht::token& b) {
         // check that range a is before token b.
@@ -104,7 +111,7 @@ static bool belongs_to_current_node(const dht::token& t, const std::vector<range
     });
 
     if (low != sorted_owned_ranges.end()) {
-        const range<dht::token>& r = *low;
+        const dht::token_range& r = *low;
         return r.contains(t, dht::token_comparator());
     }
 
@@ -218,6 +225,10 @@ future<std::vector<shared_sstable>>
 compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::function<shared_sstable()> creator,
                  uint64_t max_sstable_size, uint32_t sstable_level, bool cleanup) {
     return seastar::async([sstables = std::move(sstables), &cf, creator = std::move(creator), max_sstable_size, sstable_level, cleanup] () mutable {
+        // keep a immutable copy of sstable set because selector needs it alive
+        // and also sstables created after compaction shouldn't be considered.
+        const sstable_set s = cf.get_sstable_set();
+        auto selector = s.make_incremental_selector();
         std::vector<::mutation_reader> readers;
         uint64_t estimated_partitions = 0;
         std::vector<unsigned long> ancestors;
@@ -232,8 +243,6 @@ compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::f
         assert(sstables.size() > 0);
 
         db::replay_position rp;
-
-        std::vector<shared_sstable> not_compacted_sstables = get_uncompacting_sstables(cf, sstables);
 
         auto schema = cf.schema();
         for (auto sst : sstables) {
@@ -267,7 +276,7 @@ compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::f
         info->cf = schema->cf_name();
         logger.info("{} {}", (!cleanup) ? "Compacting" : "Cleaning", sstable_logger_msg);
 
-        std::vector<range<dht::token>> owned_ranges;
+        dht::token_range_vector owned_ranges;
         if (cleanup) {
             owned_ranges = service::get_local_storage_service().get_local_ranges(schema->ks_name());
         }
@@ -276,8 +285,9 @@ compact_sstables(std::vector<shared_sstable> sstables, column_family& cf, std::f
 
         auto start_time = db_clock::now();
 
-        auto get_max_purgeable = [schema, not_compacted_sstables] (const dht::decorated_key& dk) {
-            return get_max_purgeable_timestamp(schema, not_compacted_sstables, dk);
+        std::unordered_set<shared_sstable> compacting_set(sstables.begin(), sstables.end());
+        auto get_max_purgeable = [&cf, &selector, &compacting_set] (const dht::decorated_key& dk) {
+            return get_max_purgeable_timestamp(cf, selector, compacting_set, dk);
         };
         auto cr = compacting_sstable_writer(*schema, creator, partitions_per_sstable, max_sstable_size, sstable_level, rp, std::move(ancestors), *info);
         auto cfc = make_stable_flattened_mutations_consumer<compact_for_compaction<compacting_sstable_writer>>(

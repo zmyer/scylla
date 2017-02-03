@@ -30,10 +30,9 @@
 #include "version.hh"
 #include "schema_registry.hh"
 #include <boost/range/algorithm.hpp>
+#include <boost/algorithm/cxx11/any_of.hpp>
 
 constexpr int32_t schema::NAME_LENGTH;
-
-const std::experimental::optional<sstring> schema::DEFAULT_COMPRESSOR = sstring("LZ4Compressor");
 
 sstring to_sstring(column_kind k) {
     switch (k) {
@@ -65,6 +64,21 @@ column_mapping_entry::column_mapping_entry(bytes name, sstring type_name)
 {
 }
 
+column_mapping_entry::column_mapping_entry(const column_mapping_entry& o)
+    : _name(o._name)
+    , _type(db::marshal::type_parser::parse(o._type->name()))
+{
+}
+
+column_mapping_entry& column_mapping_entry::operator=(const column_mapping_entry& o) {
+    if (this != &o) {
+        auto tmp = o;
+        this->~column_mapping_entry();
+        new (this) column_mapping_entry(std::move(tmp));
+    }
+    return *this;
+}
+
 template<typename Sequence>
 std::vector<data_type>
 get_column_types(const Sequence& column_definitions) {
@@ -73,6 +87,23 @@ get_column_types(const Sequence& column_definitions) {
         result.push_back(col.type);
     }
     return result;
+}
+
+std::ostream& operator<<(std::ostream& out, const column_mapping& cm) {
+    column_id n_static = cm.n_static();
+    column_id n_regular = cm.columns().size() - n_static;
+
+    auto pr_entry = [] (column_id i, const column_mapping_entry& e) {
+        // Without schema we don't know if name is UTF8. If we had schema we could use
+        // s->regular_column_name_type()->to_string(e.name()).
+        return sprint("{id=%s, name=0x%s, type=%s}", i, e.name(), e.type()->name());
+    };
+
+    return out << "{static=[" << ::join(", ", boost::irange<column_id>(0, n_static) |
+            boost::adaptors::transformed([&] (column_id i) { return pr_entry(i, cm.static_column_at(i)); }))
+        << "], regular=[" << ::join(", ", boost::irange<column_id>(0, n_regular) |
+            boost::adaptors::transformed([&] (column_id i) { return pr_entry(i, cm.regular_column_at(i)); }))
+        << "]}";
 }
 
 ::shared_ptr<cql3::column_specification>
@@ -150,6 +181,7 @@ schema::schema(const raw_schema& raw)
         };
     }())
     , _regular_columns_by_name(serialized_compare(_raw._regular_column_name_type))
+    , _is_counter(_raw._default_validator->is_counter())
 {
     struct name_compare {
         data_type type;
@@ -258,6 +290,7 @@ schema::schema(const schema& o)
     : _raw(o._raw)
     , _offsets(o._offsets)
     , _regular_columns_by_name(serialized_compare(_raw._regular_column_name_type))
+    , _is_counter(o._is_counter)
 {
     rebuild();
 }
@@ -318,7 +351,8 @@ bool operator==(const schema& x, const schema& y)
         && x._raw._compaction_strategy_options == y._raw._compaction_strategy_options
         && x._raw._caching_options == y._raw._caching_options
         && x._raw._dropped_columns == y._raw._dropped_columns
-        && x._raw._collections == y._raw._collections;
+        && x._raw._collections == y._raw._collections
+        && x._raw._view_info == y._raw._view_info;
 #if 0
         && Objects.equal(triggers, other.triggers)
 #endif
@@ -331,7 +365,14 @@ index_info::index_info(::index_type idx_type,
 {}
 
 column_definition::column_definition(bytes name, data_type type, column_kind kind, column_id component_index, index_info idx, api::timestamp_type dropped_at)
-        : _name(std::move(name)), _dropped_at(dropped_at), _is_atomic(type->is_atomic()), type(std::move(type)), id(component_index), kind(kind), idx_info(std::move(idx))
+        : _name(std::move(name))
+        , _dropped_at(dropped_at)
+        , _is_atomic(type->is_atomic())
+        , _is_counter(type->is_counter())
+        , type(std::move(type))
+        , id(component_index)
+        , kind(kind)
+        , idx_info(std::move(idx))
 {}
 
 std::ostream& operator<<(std::ostream& os, const column_definition& cd) {
@@ -433,6 +474,9 @@ std::ostream& operator<<(std::ostream& os, const schema& s) {
         os << c.first << " : " << c.second->name();
     }
     os << "}";
+    if (s.is_view()) {
+        os << ", viewInfo=" << *s.view_info();
+    }
     os << "]";
     return os;
 }
@@ -569,6 +613,8 @@ schema_builder& schema_builder::with_column(bytes name, data_type type, index_in
     _raw._columns.emplace_back(name, type, kind, component_index, info);
     if (type->is_multi_cell()) {
         with_collection(name, type);
+    } else if (type->is_counter()) {
+        set_default_validator(counter_type);
     }
     return *this;
 }
@@ -653,6 +699,11 @@ void schema_builder::prepare_dense_schema(schema::raw_schema& raw) {
     }
 }
 
+schema_builder& schema_builder::with_view_info(utils::UUID base_id, sstring base_name, bool include_all_columns, sstring where_clause) {
+    _raw._view_info = view_info(std::move(base_id), std::move(base_name), include_all_columns, std::move(where_clause));
+    return *this;
+}
+
 schema_ptr schema_builder::build() {
     schema::raw_schema new_raw = _raw; // Copy so that build() remains idempotent.
 
@@ -699,11 +750,6 @@ namespace cell_comparator {
 static constexpr auto _composite_str = "org.apache.cassandra.db.marshal.CompositeType";
 static constexpr auto _collection_str = "org.apache.cassandra.db.marshal.ColumnToCollectionType";
 
-static bool always_include_default() {
-    static thread_local bool def = version::version::current() < version::version(2, 2);
-    return def;
-};
-
 static sstring compound_name(const schema& s) {
     sstring compound(_composite_str);
 
@@ -713,7 +759,8 @@ static sstring compound_name(const schema& s) {
             compound += t.type->name() + ",";
         }
     }
-    if (always_include_default() || (s.clustering_key_size() == 0)) {
+
+    if (!s.is_dense()) {
         compound += s.regular_column_name_type()->name() + ",";
     }
 
@@ -733,10 +780,13 @@ static sstring compound_name(const schema& s) {
 }
 
 sstring to_sstring(const schema& s) {
-    if (!s.is_compound()) {
-        return s.regular_column_name_type()->name();
-    } else {
+    if (s.is_compound()) {
         return compound_name(s);
+    } else if (s.clustering_key_size() == 1) {
+        assert(s.is_dense());
+        return s.clustering_key_columns().front().type->name();
+    } else {
+        return s.regular_column_name_type()->name();
     }
 }
 
@@ -933,4 +983,32 @@ bool schema::is_synced() const {
 
 bool schema::equal_columns(const schema& other) const {
     return boost::equal(all_columns_in_select_order(), other.all_columns_in_select_order());
+}
+
+view_info::view_info(utils::UUID base_id, sstring base_name, bool include_all_columns, sstring where_clause)
+        : _base_id(std::move(base_id))
+        , _base_name(std::move(base_name))
+        , _include_all_columns(include_all_columns)
+        , _where_clause(where_clause)
+{ }
+
+bool operator==(const view_info& x, const view_info& y) {
+    return x._base_id == y._base_id
+        && x._base_name == y._base_name
+        && x._include_all_columns == y._include_all_columns
+        && x._where_clause == y._where_clause;
+}
+
+std::ostream& operator<<(std::ostream& os, const view_info& view) {
+    os << "ViewInfo{";
+    os << "baseTableId=" << view._base_id;
+    os << ", baseTableName=" << view._base_name;
+    os << ", includeAllColumns=" << view._include_all_columns;
+    os << ", whereClause=" << view._where_clause;
+    os << "}";
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const view_ptr& view) {
+    return view ? os << *view : os << "null";
 }

@@ -1,17 +1,6 @@
 #!/bin/bash -e
 
-. /etc/os-release
-if [ "$ID" = "ubuntu" ]; then
-    . /etc/default/scylla-server
-else
-    . /etc/sysconfig/scylla-server
-fi
-for i in /etc/scylla.d/*.conf; do
-    if [ "$i" = "/etc/scylla.d/*.conf" ]; then
-        break
-    fi
-    . "$i"
-done
+. /usr/lib/scylla/scylla_lib.sh
 
 if [ "$AMI" = "yes" ] && [ -f /etc/scylla/ami_disabled ]; then
     rm /etc/scylla/ami_disabled
@@ -27,7 +16,7 @@ if [ "$NETWORK_MODE" = "virtio" ]; then
 elif [ "$NETWORK_MODE" = "dpdk" ]; then
     modprobe uio
     modprobe uio_pci_generic
-    /usr/lib/scylla/dpdk_nic_bind.py --force --bind=uio_pci_generic $ETHPCIID
+    /usr/lib/scylla/dpdk-devbind.py --force --bind=uio_pci_generic $ETHPCIID
     for n in /sys/devices/system/node/node?; do
         echo $NR_HUGEPAGES > $n/hugepages/hugepages-2048kB/nr_hugepages
     done
@@ -39,3 +28,5 @@ fi
 if [ "$ID" = "ubuntu" ]; then
     hugeadm --create-mounts
 fi
+
+/usr/lib/scylla/scylla-blocktune

@@ -55,7 +55,7 @@
 #include "log.hh"
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/scollectd.hh>
+#include <seastar/core/metrics.hh>
 #include <chrono>
 #include "dht/i_partitioner.hh"
 #include <boost/range/algorithm/set_algorithm.hpp>
@@ -71,6 +71,10 @@ constexpr std::chrono::hours gossiper::A_VERY_LONG_TIME;
 constexpr int64_t gossiper::MAX_GENERATION_DIFFERENCE;
 
 distributed<gossiper> _the_gossiper;
+
+net::msg_addr gossiper::get_msg_addr(inet_address to) {
+    return msg_addr{to, _default_cpuid};
+}
 
 sstring gossiper::get_cluster_name() {
     return _cluster_name;
@@ -113,24 +117,19 @@ gossiper::gossiper() {
     /* register with the Failure Detector for receiving Failure detector events */
     get_local_failure_detector().register_failure_detection_event_listener(this);
     // Register this instance with JMX
-    _collectd_registrations = std::make_unique<scollectd::registrations>(setup_collectd());
-}
-
-scollectd::registrations
-gossiper::setup_collectd() {
+    namespace sm = seastar::metrics;
     auto ep = get_broadcast_address();
-    return {
-        scollectd::add_polled_metric(
-            scollectd::type_instance_id("gossip", scollectd::per_cpu_plugin_instance,
-                    "derive", "heart_beat_version"),
-            scollectd::make_typed(scollectd::data_type::DERIVE, [ep, this] {
-                if (this->endpoint_state_map.count(ep)) {
-                    return this->endpoint_state_map.at(ep).get_heart_beat_state().get_heart_beat_version();
+    _metrics.add_group("gossip", {
+        sm::make_derive("heart_beat",
+            [ep, this] {
+                auto it = this->endpoint_state_map.find(ep);
+                if (it != this->endpoint_state_map.end()) {
+                    return it->second.get_heart_beat_state().get_heart_beat_version();
                 } else {
                     return 0;
                 }
-            })),
-    };
+            }, sm::description("Heart beat of the current Node.")),
+    });
 }
 
 void gossiper::set_last_processed_message_at() {
@@ -1561,9 +1560,12 @@ future<> gossiper::do_stop_gossiping() {
     });
 }
 
-future<> gossiper::stop_gossiping() {
-    return get_gossiper().invoke_on(0, [] (gossiper& g) {
-        return g.do_stop_gossiping();
+future<> stop_gossiping() {
+    return smp::submit_to(0, [] {
+        if (get_gossiper().local_is_initialized()) {
+            return get_local_gossiper().do_stop_gossiping();
+        }
+        return make_ready_future<>();
     });
 }
 
@@ -1842,7 +1844,7 @@ void gossiper::check_knows_remote_features(sstring local_features_string, std::u
 }
 
 static bool check_features(std::set<sstring> features, std::set<sstring> need_features) {
-    logger.info("Checking if need_features {} in features {}", need_features, features);
+    logger.debug("Checking if need_features {} in features {}", need_features, features);
     return boost::range::includes(features, need_features);
 }
 
@@ -1860,7 +1862,7 @@ future<> gossiper::wait_for_feature_on_node(std::set<sstring> features, inet_add
 
 void gossiper::register_feature(feature* f) {
     if (check_features(get_local_gossiper().get_supported_features(), {f->name()})) {
-        f->_enabled = true;
+        f->enable();
     } else {
         _registered_features.emplace(f->name(), std::vector<feature*>()).first->second.emplace_back(f);
     }
@@ -1887,7 +1889,7 @@ void gossiper::maybe_enable_features() {
     for (auto it = _registered_features.begin(); it != _registered_features.end(); ) {
         if (features.find(it->first) != features.end()) {
             for (auto&& f : it->second) {
-                f->_enabled = true;
+                f->enable();
             }
             it = _registered_features.erase(it);
         } else {
@@ -1923,6 +1925,13 @@ feature& feature::operator=(feature other) {
         get_local_gossiper().register_feature(this);
     }
     return *this;
+}
+
+void feature::enable() {
+    if (engine().cpu_id() == 0) {
+        logger.info("Feature {} is enabled", name());
+    }
+    _enabled = true;
 }
 
 } // namespace gms

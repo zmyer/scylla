@@ -49,14 +49,14 @@
 #include "gms/application_state.hh"
 #include "gms/endpoint_state.hh"
 #include "gms/feature.hh"
-#include "message/messaging_service.hh"
+#include "message/messaging_service_fwd.hh"
 #include <boost/algorithm/string.hpp>
 #include <experimental/optional>
 #include <algorithm>
 #include <chrono>
 #include <set>
 #include <seastar/core/condition-variable.hh>
-#include <seastar/core/scollectd.hh>
+#include <seastar/core/metrics_registration.hh>
 
 namespace gms {
 
@@ -86,7 +86,7 @@ public:
 private:
     using messaging_verb = net::messaging_verb;
     using messaging_service = net::messaging_service;
-    using msg_addr = net::messaging_service::msg_addr;
+    using msg_addr = net::msg_addr;
     net::messaging_service& ms() {
         return net::get_local_messaging_service();
     }
@@ -98,9 +98,7 @@ private:
     future<> handle_echo_msg();
     future<> handle_shutdown_msg(inet_address from);
     static constexpr uint32_t _default_cpuid = 0;
-    msg_addr get_msg_addr(inet_address to) {
-        return msg_addr{to, _default_cpuid};
-    }
+    msg_addr get_msg_addr(inet_address to);
     void do_sort(std::vector<gossip_digest>& g_digest_list);
     timer<lowres_clock> _scheduled_gossip_task;
     bool _enabled = false;
@@ -483,8 +481,6 @@ public:
 
     // Needed by seastar::sharded
     future<> stop();
-    future<> stop_gossiping();
-private:
     future<> do_stop_gossiping();
 
 public:
@@ -539,16 +535,19 @@ private:
     void unregister_feature(feature* f);
     void maybe_enable_features();
 private:
-    std::unique_ptr<scollectd::registrations> _collectd_registrations;
-    scollectd::registrations setup_collectd();
+    seastar::metrics::metric_groups _metrics;
 };
 
 extern distributed<gossiper> _the_gossiper;
+
 inline gossiper& get_local_gossiper() {
     return _the_gossiper.local();
 }
+
 inline distributed<gossiper>& get_gossiper() {
     return _the_gossiper;
 }
+
+future<> stop_gossiping();
 
 } // namespace gms

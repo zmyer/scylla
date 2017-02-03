@@ -44,6 +44,7 @@
 
 namespace cql3 {
 
+thread_local const ::shared_ptr<constants::value> constants::UNSET_VALUE = ::make_shared<constants::value>(cql3::raw_value::make_unset_value());
 thread_local const ::shared_ptr<term::raw> constants::NULL_LITERAL = ::make_shared<constants::null_literal>();
 thread_local const ::shared_ptr<terminal> constants::null_literal::NULL_VALUE = ::make_shared<constants::null_literal::null_value>();
 
@@ -97,7 +98,9 @@ constants::literal::test_assignment(database& db, const sstring& keyspace, ::sha
                     cql3_type::kind::TEXT,
                     cql3_type::kind::INET,
                     cql3_type::kind::VARCHAR,
-                    cql3_type::kind::TIMESTAMP>::contains(kind)) {
+                    cql3_type::kind::TIMESTAMP,
+                    cql3_type::kind::DATE,
+                    cql3_type::kind::TIME>::contains(kind)) {
                 return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
             }
             break;
@@ -109,7 +112,10 @@ constants::literal::test_assignment(database& db, const sstring& keyspace, ::sha
                     cql3_type::kind::DOUBLE,
                     cql3_type::kind::FLOAT,
                     cql3_type::kind::INT,
+                    cql3_type::kind::SMALLINT,
                     cql3_type::kind::TIMESTAMP,
+                    cql3_type::kind::DATE,
+                    cql3_type::kind::TINYINT,
                     cql3_type::kind::VARINT>::contains(kind)) {
                 return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
             }
@@ -150,7 +156,7 @@ constants::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<
         throw exceptions::invalid_request_exception(sprint("Invalid %s constant (%s) for \"%s\" of type %s",
             _type, _text, *receiver->name, receiver->type->as_cql3_type()->to_string()));
     }
-    return ::make_shared<value>(std::experimental::make_optional(parsed_value(receiver->type)));
+    return ::make_shared<value>(cql3::raw_value::make_value(parsed_value(receiver->type)));
 }
 
 void constants::deleter::execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) {

@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <seastar/core/thread.hh>
 #include <seastar/tests/test-utils.hh>
@@ -42,9 +41,9 @@ void check_order_of_fragments(streamed_mutation sm)
     auto mf = sm().get0();
     while (mf) {
         if (previous) {
-            BOOST_REQUIRE(cmp(*previous, *mf));
+            BOOST_REQUIRE(cmp(*previous, mf->position()));
         }
-        previous = mf->position();
+        previous = position_in_partition(mf->position());
         mf = sm().get0();
     }
 }
@@ -145,7 +144,7 @@ SEASTAR_TEST_CASE(test_fragmenting_and_freezing_streamed_mutations) {
                 return make_ready_future<>();
             }, 1).get0();
 
-            auto expected_fragments = m.partition().clustered_rows().size()
+            auto expected_fragments = m.partition().clustered_rows().calculate_size()
                                       + m.partition().row_tombstones().size()
                                       + !m.partition().static_row().empty();
             BOOST_REQUIRE_EQUAL(fms.size(), std::max(expected_fragments, size_t(1)));

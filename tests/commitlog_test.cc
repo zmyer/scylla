@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/test/unit_test.hpp>
 
@@ -53,8 +52,10 @@ static future<> cl_test(commitlog::config cfg, Func && f) {
     cfg.commit_log_location = tmp.path;
     return commitlog::create_commitlog(cfg).then([f = std::forward<Func>(f)](commitlog log) mutable {
         return do_with(std::move(log), [f = std::forward<Func>(f)](commitlog& log) {
-            return futurize<std::result_of_t<Func(commitlog&)>>::apply(f, log).finally([&log] {
-                return log.clear();
+            return futurize_apply(f, log).finally([&log] {
+                return log.shutdown().then([&log] {
+                    return log.clear();
+                });
             });
         });
     }).finally([tmp = std::move(tmp)] {
@@ -277,6 +278,21 @@ SEASTAR_TEST_CASE(test_commitlog_delete_when_over_disk_limit) {
 }
 
 SEASTAR_TEST_CASE(test_commitlog_reader){
+    static auto count_mutations_in_segment = [] (sstring path) -> future<size_t> {
+        auto count = make_lw_shared<size_t>(0);
+        return db::commitlog::read_log_file(path, [count](temporary_buffer<char> buf, db::replay_position rp) {
+            sstring str(buf.get(), buf.size());
+            BOOST_CHECK_EQUAL(str, "hej bubba cow");
+            (*count)++;
+            return make_ready_future<>();
+        }).then([](auto s) {
+            return do_with(std::move(s), [](auto& s) {
+                return s->done();
+            });
+        }).then([count] {
+            return *count;
+        });
+    };
     commitlog::config cfg;
     cfg.commitlog_segment_size_in_mb = 1;
     return cl_test(cfg, [](commitlog& log) {
@@ -309,18 +325,19 @@ SEASTAR_TEST_CASE(test_commitlog_reader){
                         if (i == segments.end()) {
                             throw std::runtime_error("Did not find expected log file");
                         }
-                        return db::commitlog::read_log_file(*i, [count2](temporary_buffer<char> buf, db::replay_position rp) {
-                                    sstring str(buf.get(), buf.size());
-                                    BOOST_CHECK_EQUAL(str, "hej bubba cow");
-                                    (*count2)++;
-                                    return make_ready_future<>();
-                                }).then([](auto s) {
-                                    return do_with(std::move(s), [](auto& s) {
-                                        return s->done();
-                                    });
+                        return *i;
+                    }).then([&log, count] (sstring segment_path) {
+                        // Check reading from an unsynced segment
+                        return count_mutations_in_segment(segment_path).then([count] (size_t replay_count) {
+                            BOOST_CHECK_GE(*count, replay_count);
+                        }).then([&log, count, segment_path] {
+                            return log.sync_all_segments().then([count, segment_path] {
+                                // Check reading from a synced segment
+                                return count_mutations_in_segment(segment_path).then([count] (size_t replay_count) {
+                                    BOOST_CHECK_EQUAL(*count, replay_count);
                                 });
-                    }).then([count, count2] {
-                        BOOST_CHECK_EQUAL(*count, *count2);
+                            });
+                        });
                     });
         });
 }
@@ -424,6 +441,50 @@ SEASTAR_TEST_CASE(test_commitlog_chunk_corruption){
                                     BOOST_REQUIRE(e.bytes() > 0);
                                 }
                             });
+                        });
+                    });
+        });
+}
+
+SEASTAR_TEST_CASE(test_commitlog_reader_produce_exception){
+    commitlog::config cfg;
+    cfg.commitlog_segment_size_in_mb = 1;
+    return cl_test(cfg, [](commitlog& log) {
+        auto count = make_lw_shared<size_t>(0);
+        auto rps = make_lw_shared<std::vector<db::replay_position>>();
+        return do_until([count]() {return *count  > 1;},
+                    [&log, count, rps]() {
+                        auto uuid = utils::UUID_gen::get_time_UUID();
+                        sstring tmp = "hej bubba cow";
+                        return log.add_mutation(uuid, tmp.size(), [tmp](db::commitlog::output& dst) {
+                                    dst.write(tmp.begin(), tmp.end());
+                                }).then([&log, rps, count](replay_position rp) {
+                                    BOOST_CHECK_NE(rp, db::replay_position());
+                                    rps->push_back(rp);
+                                    ++(*count);
+                                });
+                    }).then([&log, rps]() {
+                        return log.sync_all_segments();
+                    }).then([&log, rps] {
+                        auto segments = log.get_active_segment_names();
+                        BOOST_REQUIRE(!segments.empty());
+                        auto seg = segments[0];
+                        return db::commitlog::read_log_file(seg, [rps](temporary_buffer<char> buf, db::replay_position rp) {
+                            return make_exception_future(std::runtime_error("I am in a throwing mode"));
+                        }).then([](auto s) {
+                            return do_with(std::move(s), [](auto& s) {
+                                return s->done();
+                            });
+                        }).then_wrapped([](auto&& f) {
+                            try {
+                                f.get();
+                                BOOST_FAIL("Expected exception");
+                            } catch (std::runtime_error&) {
+                                // Ok
+                            } catch (...) {
+                                // ok.
+                                BOOST_FAIL("Wrong exception");
+                            }
                         });
                     });
         });

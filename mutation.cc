@@ -62,7 +62,7 @@ void mutation::set_static_cell(const bytes& name, const data_value& value, api::
 }
 
 void mutation::set_clustered_cell(const exploded_clustering_prefix& prefix, const column_definition& def, atomic_cell_or_collection&& value) {
-    auto& row = partition().clustered_row(clustering_key::from_clustering_prefix(*schema(), prefix)).cells();
+    auto& row = partition().clustered_row(*schema(), clustering_key::from_clustering_prefix(*schema(), prefix)).cells();
     row.apply(def, std::move(value));
 }
 
@@ -76,7 +76,7 @@ void mutation::set_clustered_cell(const clustering_key& key, const bytes& name, 
 }
 
 void mutation::set_clustered_cell(const clustering_key& key, const column_definition& def, atomic_cell_or_collection&& value) {
-    auto& row = partition().clustered_row(key).cells();
+    auto& row = partition().clustered_row(*schema(), key).cells();
     row.apply(def, std::move(value));
 }
 
@@ -108,7 +108,7 @@ mutation::get_cell(const clustering_key& rkey, const column_definition& def) con
         }
         return { *cell };
     } else {
-        const row* r = partition().find_row(rkey);
+        const row* r = partition().find_row(*schema(), rkey);
         if (!r) {
             return {};
         }
@@ -145,7 +145,7 @@ mutation::query(const query::partition_slice& slice,
     query::result_request request,
     gc_clock::time_point now, uint32_t row_limit) &&
 {
-    query::result::builder builder(slice, request);
+    query::result::builder builder(slice, request, { });
     std::move(*this).query(builder, slice, now, row_limit);
     return builder.build();
 }
@@ -169,7 +169,7 @@ mutation_decorated_key_less_comparator::operator()(const mutation& m1, const mut
 }
 
 boost::iterator_range<std::vector<mutation>::const_iterator>
-slice(const std::vector<mutation>& partitions, const query::partition_range& r) {
+slice(const std::vector<mutation>& partitions, const dht::partition_range& r) {
     struct cmp {
         bool operator()(const dht::ring_position& pos, const mutation& m) const {
             return m.decorated_key().tri_compare(*m.schema(), pos) > 0;
@@ -211,6 +211,22 @@ void mutation::apply(const mutation& m) {
 
 mutation& mutation::operator=(const mutation& m) {
     return *this = mutation(m);
+}
+
+mutation mutation::operator+(const mutation& other) const {
+    auto m = *this;
+    m.apply(other);
+    return m;
+}
+
+mutation& mutation::operator+=(const mutation& other) {
+    apply(other);
+    return *this;
+}
+
+mutation& mutation::operator+=(mutation&& other) {
+    apply(std::move(other));
+    return *this;
 }
 
 enum class limit_mutation_size { yes, no };
@@ -271,7 +287,7 @@ public:
         if (!check_remaining_limit(cr)) {
             return stop_iteration::yes;
         }
-        auto& dr = _m.partition().clustered_row(std::move(cr.key()));
+        auto& dr = _m.partition().clustered_row(*_m.schema(), std::move(cr.key()));
         dr.apply(cr.tomb());
         dr.apply(cr.marker());
         dr.cells().apply(*_m.schema(), column_kind::regular_column, std::move(cr.cells()));

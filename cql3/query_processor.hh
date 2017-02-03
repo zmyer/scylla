@@ -43,6 +43,7 @@
 
 #include <experimental/string_view>
 #include <unordered_map>
+#include <seastar/core/metrics_registration.hh>
 
 #include "core/shared_ptr.hh"
 #include "exceptions/exceptions.hh"
@@ -75,7 +76,9 @@ private:
         uint64_t prepare_invocations = 0;
     } _stats;
 
-    std::vector<scollectd::registration> _collectd_regs;
+    cql_stats _cql_stats;
+
+    seastar::metrics::metric_groups _metrics;
 
     class internal_state;
     std::unique_ptr<internal_state> _internal_state;
@@ -92,6 +95,11 @@ public:
     distributed<service::storage_proxy>& proxy() {
         return _proxy;
     }
+
+    cql_stats& get_cql_stats() {
+        return _cql_stats;
+    }
+
 #if 0
     public static final QueryProcessor instance = new QueryProcessor();
 #endif
@@ -518,18 +526,21 @@ public:
     virtual void on_create_user_type(const sstring& ks_name, const sstring& type_name) override;
     virtual void on_create_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_create_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
+    virtual void on_create_view(const sstring& ks_name, const sstring& view_name) override;
 
     virtual void on_update_keyspace(const sstring& ks_name) override;
     virtual void on_update_column_family(const sstring& ks_name, const sstring& cf_name, bool columns_changed) override;
     virtual void on_update_user_type(const sstring& ks_name, const sstring& type_name) override;
     virtual void on_update_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
+    virtual void on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed) override;
 
     virtual void on_drop_keyspace(const sstring& ks_name) override;
     virtual void on_drop_column_family(const sstring& ks_name, const sstring& cf_name) override;
     virtual void on_drop_user_type(const sstring& ks_name, const sstring& type_name) override;
     virtual void on_drop_function(const sstring& ks_name, const sstring& function_name) override;
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override;
+    virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override;
 private:
     void remove_invalid_prepared_statements(sstring ks_name, std::experimental::optional<sstring> cf_name);
     bool should_invalidate(sstring ks_name, std::experimental::optional<sstring> cf_name, ::shared_ptr<cql_statement> statement);

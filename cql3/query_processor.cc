@@ -38,11 +38,13 @@
  * You should have received a copy of the GNU General Public License
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <seastar/core/metrics.hh>
 
 #include "cql3/query_processor.hh"
 #include "cql3/CqlParser.hpp"
 #include "cql3/error_collector.hh"
 #include "cql3/statements/batch_statement.hh"
+#include "cql3/util.hh"
 
 #include "transport/messages/result_message.hh"
 
@@ -58,7 +60,7 @@ logging::logger log("query_processor");
 
 distributed<query_processor> _the_query_processor;
 
-const sstring query_processor::CQL_VERSION = "3.2.1";
+const sstring query_processor::CQL_VERSION = "3.3.1";
 
 class query_processor::internal_state {
     service::query_state _qs;
@@ -94,11 +96,42 @@ query_processor::query_processor(distributed<service::storage_proxy>& proxy,
     , _db(db)
     , _internal_state(new internal_state())
 {
-    _collectd_regs.push_back(
-        scollectd::add_polled_metric(scollectd::type_instance_id("query_processor"
-                , scollectd::per_cpu_plugin_instance
-                , "total_operations", "statements_prepared")
-                , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.prepare_invocations)));
+    namespace sm = seastar::metrics;
+
+    _metrics.add_group("query_processor", {
+        sm::make_derive("statements_prepared", _stats.prepare_invocations,
+                        sm::description("Counts a total number of parsed CQL requests.")),
+    });
+
+    _metrics.add_group("cql", {
+        sm::make_derive("reads", _cql_stats.reads,
+                        sm::description("Counts a total number of CQL read requests.")),
+
+        sm::make_derive("inserts", _cql_stats.inserts,
+                        sm::description("Counts a total number of CQL INSERT requests.")),
+
+        sm::make_derive("updates", _cql_stats.updates,
+                        sm::description("Counts a total number of CQL UPDATE requests.")),
+
+        sm::make_derive("deletes", _cql_stats.deletes,
+                        sm::description("Counts a total number of CQL DELETE requests.")),
+
+        sm::make_derive("batches", _cql_stats.batches,
+                        sm::description("Counts a total number of CQL BATCH requests.")),
+
+        sm::make_derive("statements_in_batches", _cql_stats.statements_in_batches,
+                        sm::description("Counts a total number of sub-statements in CQL BATCH requests.")),
+
+        sm::make_derive("batches_pure_logged", _cql_stats.batches_pure_logged,
+                        sm::description("Counts a total number of LOGGED batches that were executed as LOGGED batches.")),
+
+        sm::make_derive("batches_pure_unlogged", _cql_stats.batches_pure_unlogged,
+                        sm::description("Counts a total number of UNLOGGED batches that were executed as UNLOGGED batches.")),
+
+        sm::make_derive("batches_unlogged_from_logged", _cql_stats.batches_unlogged_from_logged,
+                        sm::description("Counts a total number of LOGGED batches that were executed as UNLOGGED batches.")),
+    });
+
     service::get_local_migration_manager().register_listener(_migration_subscriber.get());
 }
 
@@ -285,31 +318,18 @@ query_processor::get_statement(const sstring_view& query, const service::client_
         Tracing.trace("Preparing statement");
 #endif
     ++_stats.prepare_invocations;
-    return statement->prepare(_db.local());
+    return statement->prepare(_db.local(), _cql_stats);
 }
 
 ::shared_ptr<raw::parsed_statement>
 query_processor::parse_statement(const sstring_view& query)
 {
     try {
-        cql3_parser::CqlLexer::collector_type lexer_error_collector(query);
-        cql3_parser::CqlParser::collector_type parser_error_collector(query);
-        cql3_parser::CqlLexer::InputStreamType input{reinterpret_cast<const ANTLR_UINT8*>(query.begin()), ANTLR_ENC_UTF8, static_cast<ANTLR_UINT32>(query.size()), nullptr};
-        cql3_parser::CqlLexer lexer{&input};
-        lexer.set_error_listener(lexer_error_collector);
-        cql3_parser::CqlParser::TokenStreamType tstream(ANTLR_SIZE_HINT, lexer.get_tokSource());
-        cql3_parser::CqlParser parser{&tstream};
-        parser.set_error_listener(parser_error_collector);
-
-        auto statement = parser.query();
-
-        lexer_error_collector.throw_first_syntax_error();
-        parser_error_collector.throw_first_syntax_error();
-
+        auto statement = util::do_with_parser(query,  std::mem_fn(&cql3_parser::CqlParser::query));
         if (!statement) {
             throw exceptions::syntax_exception("Parsing failed");
         }
-        return std::move(statement);
+        return statement;
     } catch (const exceptions::recognition_exception& e) {
         throw exceptions::syntax_exception(sprint("Invalid or malformed CQL query string: %s", e.what()));
     } catch (const exceptions::cassandra_exception& e) {
@@ -328,15 +348,15 @@ query_options query_processor::make_internal_options(::shared_ptr<statements::pr
         throw std::invalid_argument(sprint("Invalid number of values. Expecting %d but got %d", p->bound_names.size(), values.size()));
     }
     auto ni = p->bound_names.begin();
-    std::vector<bytes_opt> bound_values;
+    std::vector<cql3::raw_value> bound_values;
     for (auto& v : values) {
         auto& n = *ni++;
         if (v.type() == bytes_type) {
-            bound_values.push_back({value_cast<bytes>(v)});
+            bound_values.push_back(cql3::raw_value::make_value(value_cast<bytes>(v)));
         } else if (v.is_null()) {
-            bound_values.push_back({});
+            bound_values.push_back(cql3::raw_value::make_null());
         } else {
-            bound_values.push_back({n->type->decompose(v)});
+            bound_values.push_back(cql3::raw_value::make_value(n->type->decompose(v)));
         }
     }
     return query_options(cl, bound_values);
@@ -346,7 +366,7 @@ query_options query_processor::make_internal_options(::shared_ptr<statements::pr
 {
     auto& p = _internal_statements[query_string];
     if (p == nullptr) {
-        auto np = parse_statement(query_string)->prepare(_db.local());
+        auto np = parse_statement(query_string)->prepare(_db.local(), _cql_stats);
         np->statement->validate(_proxy, *_internal_state);
         p = std::move(np); // inserts it into map
     }
@@ -382,7 +402,7 @@ query_processor::process(const sstring& query_string,
                          const std::initializer_list<data_value>& values,
                          bool cache)
 {
-    auto p = cache ? prepare_internal(query_string) : parse_statement(query_string)->prepare(_db.local());
+    auto p = cache ? prepare_internal(query_string) : parse_statement(query_string)->prepare(_db.local(), _cql_stats);
     if (!cache) {
         p->statement->validate(_proxy, *_internal_state);
     }
@@ -441,6 +461,10 @@ void query_processor::migration_subscriber::on_create_aggregate(const sstring& k
     log.warn("{} event ignored", __func__);
 }
 
+void query_processor::migration_subscriber::on_create_view(const sstring& ks_name, const sstring& view_name)
+{
+}
+
 void query_processor::migration_subscriber::on_update_keyspace(const sstring& ks_name)
 {
 }
@@ -461,6 +485,10 @@ void query_processor::migration_subscriber::on_update_function(const sstring& ks
 }
 
 void query_processor::migration_subscriber::on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name)
+{
+}
+
+void query_processor::migration_subscriber::on_update_view(const sstring& ks_name, const sstring& view_name, bool columns_changed)
 {
 }
 
@@ -486,6 +514,10 @@ void query_processor::migration_subscriber::on_drop_function(const sstring& ks_n
 void query_processor::migration_subscriber::on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name)
 {
     log.warn("{} event ignored", __func__);
+}
+
+void query_processor::migration_subscriber::on_drop_view(const sstring& ks_name, const sstring& view_name)
+{
 }
 
 void query_processor::migration_subscriber::remove_invalid_prepared_statements(sstring ks_name, std::experimental::optional<sstring> cf_name)

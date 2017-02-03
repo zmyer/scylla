@@ -22,6 +22,7 @@
 #include "frozen_mutation.hh"
 #include "mutation_partition.hh"
 #include "mutation.hh"
+#include "counters.hh"
 #include "partition_builder.hh"
 #include "mutation_partition_serializer.hh"
 #include "utils/UUID.hh"
@@ -94,7 +95,7 @@ frozen_mutation::frozen_mutation(const mutation& m)
 {
     mutation_partition_serializer part_ser(*m.schema(), m.partition());
 
-    ser::writer_of_mutation wom(_bytes);
+    ser::writer_of_mutation<bytes_ostream> wom(_bytes);
     std::move(wom).write_table_id(m.schema()->id())
                   .write_schema_version(m.schema()->version())
                   .write_key(m.key())
@@ -157,7 +158,7 @@ stop_iteration streamed_mutation_freezer::consume(range_tombstone&& rt) {
 
 frozen_mutation streamed_mutation_freezer::consume_end_of_stream() {
     bytes_ostream out;
-    ser::writer_of_mutation wom(out);
+    ser::writer_of_mutation<bytes_ostream> wom(out);
     std::move(wom).write_table_id(_schema.id())
                   .write_schema_version(_schema.version())
                   .write_key(_key)
@@ -192,7 +193,7 @@ class fragmenting_mutation_freezer {
 private:
     future<> flush() {
         bytes_ostream out;
-        ser::writer_of_mutation wom(out);
+        ser::writer_of_mutation<bytes_ostream> wom(out);
         std::move(wom).write_table_id(_schema.id())
                       .write_schema_version(_schema.version())
                       .write_key(_key)
@@ -227,18 +228,18 @@ public:
 
     future<stop_iteration> consume(static_row&& sr) {
         _sr = std::move(sr);
-        _dirty_size += _sr->memory_usage() + sizeof(sr);
+        _dirty_size += _sr->memory_usage();
         return maybe_flush();
     }
 
     future<stop_iteration> consume(clustering_row&& cr) {
-        _dirty_size += cr.memory_usage() + sizeof(cr);
+        _dirty_size += cr.memory_usage();
         _crs.emplace_back(std::move(cr));
         return maybe_flush();
     }
 
     future<stop_iteration> consume(range_tombstone&& rt) {
-        _dirty_size += rt.memory_usage() + sizeof(range_tombstone);
+        _dirty_size += rt.memory_usage();
         _rts.apply(_schema, std::move(rt));
         return maybe_flush();
     }

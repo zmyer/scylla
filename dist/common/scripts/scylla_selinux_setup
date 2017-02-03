@@ -2,9 +2,9 @@
 #
 #  Copyright (C) 2015 ScyllaDB
 
-. /etc/os-release
+. /usr/lib/scylla/scylla_lib.sh
 
-if [ "$ID" != "ubuntu" ] && [ "$ID" != "debian" ]; then
+if ! is_debian_variant; then
     if [ "`sestatus | awk '{print $3}'`" != "disabled" ]; then
         setenforce 0
         sed -e "s/enforcing/disabled/" /etc/sysconfig/selinux > /tmp/selinux

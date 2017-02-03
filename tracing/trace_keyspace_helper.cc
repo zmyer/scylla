@@ -38,7 +38,7 @@
  * You should have received a copy of the GNU General Public License
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
-
+#include <seastar/core/metrics.hh>
 #include "types.hh"
 #include "tracing/trace_keyspace_helper.hh"
 #include "service/migration_manager.hh"
@@ -61,53 +61,57 @@ struct trace_keyspace_backend_sesssion_state final : public backend_session_stat
 };
 
 trace_keyspace_helper::trace_keyspace_helper(tracing& tr)
-            : i_tracing_backend_helper(tr)
-            , _registrations{
-        scollectd::add_polled_metric(scollectd::type_instance_id("tracing_keyspace_helper"
-                        , scollectd::per_cpu_plugin_instance
-                        , "total_operations", "tracing_errors")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.tracing_errors)),
-        scollectd::add_polled_metric(scollectd::type_instance_id("tracing_keyspace_helper"
-                        , scollectd::per_cpu_plugin_instance
-                        , "total_operations", "bad_column_family_errors")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE, _stats.bad_column_family_errors))} {
+            : i_tracing_backend_helper(tr) {
+    namespace sm = seastar::metrics;
 
-        _sessions_create_cql = sprint("CREATE TABLE %s.%s ("
-                                      "session_id uuid,"
-                                      "command text,"
-                                      "client inet,"
-                                      "coordinator inet,"
-                                      "duration int,"
-                                      "parameters map<text, text>,"
-                                      "request text,"
-                                      "started_at timestamp,"
-                                      "PRIMARY KEY ((session_id))) "
-                                      "WITH default_time_to_live = 86400", KEYSPACE_NAME, SESSIONS);
+    _metrics.add_group("tracing_keyspace_helper", {
+        sm::make_derive("tracing_errors", [this] { return _stats.tracing_errors; },
+                        sm::description("Counts a number of errors during writing to a system_traces keyspace. "
+                                        "One error may cause one or more tracing records to be lost.")),
 
-        _events_create_cql = sprint("CREATE TABLE %s.%s ("
-                                    "session_id uuid,"
-                                    "event_id timeuuid,"
-                                    "activity text,"
-                                    "source inet,"
-                                    "source_elapsed int,"
-                                    "thread text,"
-                                    "PRIMARY KEY ((session_id), event_id)) "
-                                    "WITH default_time_to_live = 86400", KEYSPACE_NAME, EVENTS);
+        sm::make_derive("bad_column_family_errors", [this] { return _stats.bad_column_family_errors; },
+                        sm::description("Counts a number of times write failed due to one of the tables in the system_traces keyspace has an incompatible schema. "
+                                        "One error may result one or more tracing records to be lost. "
+                                        "Non-zero value indicates that the administrator has to take immediate steps to fix the corresponding schema. "
+                                        "The appropriate error message will be printed in the syslog.")),
+    });
 
-        _node_slow_query_log_cql = sprint("CREATE TABLE %s.%s ("
-                                    "node_ip inet,"
-                                    "shard int,"
-                                    "session_id uuid,"
-                                    "date timestamp,"
-                                    "start_time timeuuid,"
-                                    "command text,"
-                                    "duration int,"
-                                    "parameters map<text, text>,"
-                                    "source_ip inet,"
-                                    "table_names set<text>,"
-                                    "username text,"
-                                    "PRIMARY KEY (start_time, node_ip, shard)) "
-                                    "WITH default_time_to_live = 86400", KEYSPACE_NAME, NODE_SLOW_QUERY_LOG);
+    _sessions_create_cql = sprint("CREATE TABLE %s.%s ("
+                                  "session_id uuid,"
+                                  "command text,"
+                                  "client inet,"
+                                  "coordinator inet,"
+                                  "duration int,"
+                                  "parameters map<text, text>,"
+                                  "request text,"
+                                  "started_at timestamp,"
+                                  "PRIMARY KEY ((session_id))) "
+                                  "WITH default_time_to_live = 86400", KEYSPACE_NAME, SESSIONS);
+
+    _events_create_cql = sprint("CREATE TABLE %s.%s ("
+                                "session_id uuid,"
+                                "event_id timeuuid,"
+                                "activity text,"
+                                "source inet,"
+                                "source_elapsed int,"
+                                "thread text,"
+                                "PRIMARY KEY ((session_id), event_id)) "
+                                "WITH default_time_to_live = 86400", KEYSPACE_NAME, EVENTS);
+
+    _node_slow_query_log_cql = sprint("CREATE TABLE %s.%s ("
+                                "node_ip inet,"
+                                "shard int,"
+                                "session_id uuid,"
+                                "date timestamp,"
+                                "start_time timeuuid,"
+                                "command text,"
+                                "duration int,"
+                                "parameters map<text, text>,"
+                                "source_ip inet,"
+                                "table_names set<text>,"
+                                "username text,"
+                                "PRIMARY KEY (start_time, node_ip, shard)) "
+                                "WITH default_time_to_live = 86400", KEYSPACE_NAME, NODE_SLOW_QUERY_LOG);
 }
 
 future<> trace_keyspace_helper::setup_table(const sstring& name, const sstring& cql) const {
@@ -118,11 +122,27 @@ future<> trace_keyspace_helper::setup_table(const sstring& name, const sstring& 
         return make_ready_future<>();
     }
 
+    ::shared_ptr<cql3::statements::raw::cf_statement> parsed = static_pointer_cast<
+                    cql3::statements::raw::cf_statement>(cql3::query_processor::parse_statement(cql));
+    parsed->prepare_keyspace(KEYSPACE_NAME);
+    ::shared_ptr<cql3::statements::create_table_statement> statement =
+                    static_pointer_cast<cql3::statements::create_table_statement>(
+                                    parsed->prepare(db, qp.get_cql_stats())->statement);
+    auto schema = statement->get_cf_meta_data();
+
+    // Generate the CF UUID based on its KF names. This is needed to ensure that
+    // all Nodes that create it would create it with the same UUID and we don't
+    // hit the #420 issue.
+    auto uuid = generate_legacy_id(schema->ks_name(), schema->cf_name());
+
+    schema_builder b(schema);
+    b.set_uuid(uuid);
+
     // We don't care it it fails really - this may happen due to concurrent
     // "CREATE TABLE" invocation on different Nodes.
     // The important thing is that it will converge eventually (some traces may
     // be lost in a process but that's ok).
-    return qp.process(cql, db::consistency_level::ONE).discard_result().handle_exception([this] (auto ep) {});
+    return service::get_local_migration_manager().announce_new_column_family(b.build(), false).discard_result().handle_exception([this] (auto ep) {});;
 }
 
 bool trace_keyspace_helper::cache_sessions_table_handles(const schema_ptr& schema) {
@@ -269,7 +289,7 @@ mutation trace_keyspace_helper::make_session_mutation(const one_session_records&
     const session_record& record = session_records.session_rec;
     auto timestamp = api::new_timestamp();
     mutation m(key, schema);
-    auto& cells = m.partition().clustered_row(clustering_key::make_empty(*schema)).cells();
+    auto& cells = m.partition().clustered_row(*schema, clustering_key::make_empty(*schema)).cells();
 
     cells.apply(*_client_column, atomic_cell::make_live(timestamp, inet_addr_type->decompose(record.client.addr()), ttl));
     cells.apply(*_coordinator_column, atomic_cell::make_live(timestamp, inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr()), ttl));
@@ -306,7 +326,7 @@ mutation trace_keyspace_helper::make_slow_query_mutation(const one_session_recor
     full_components.reserve(2);
     full_components.emplace_back(inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr()));
     full_components.emplace_back(int32_type->decompose((int32_t)(engine().cpu_id())));
-    auto& cells = m.partition().clustered_row(clustering_key::from_exploded(*schema, full_components)).cells();
+    auto& cells = m.partition().clustered_row(*schema, clustering_key::from_exploded(*schema, full_components)).cells();
 
     // the corresponding tracing session ID
     cells.apply(*_slow_session_id_column, atomic_cell::make_live(timestamp, uuid_type->decompose(session_records.session_id), ttl));
@@ -364,7 +384,7 @@ mutation trace_keyspace_helper::make_event_mutation(one_session_records& session
     int64_t& last_event_nanos = backend_state_ptr->last_nanos;
     auto timestamp = api::new_timestamp();
     mutation m(key, schema);
-    auto& cells = m.partition().clustered_row(clustering_key::from_singular(*schema, utils::UUID_gen::get_time_UUID(make_monotonic_UUID_tp(last_event_nanos, record.event_time_point)))).cells();
+    auto& cells = m.partition().clustered_row(*schema, clustering_key::from_singular(*schema, utils::UUID_gen::get_time_UUID(make_monotonic_UUID_tp(last_event_nanos, record.event_time_point)))).cells();
 
     cells.apply(*_activity_column, atomic_cell::make_live(timestamp, utf8_type->decompose(record.message), ttl));
     cells.apply(*_source_column, atomic_cell::make_live(timestamp, inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr()), ttl));

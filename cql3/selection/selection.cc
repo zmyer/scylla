@@ -232,7 +232,7 @@ uint32_t selection::add_column_for_ordering(const column_definition& c) {
             raw_selector::to_selectables(raw_selectors, schema), db, schema, defs);
 
     auto metadata = collect_metadata(schema, raw_selectors, *factories);
-    if (processes_selection(raw_selectors)) {
+    if (processes_selection(raw_selectors) || raw_selectors.size() != defs.size()) {
         return ::make_shared<selection_with_processing>(schema, std::move(defs), std::move(metadata), std::move(factories));
     } else {
         return ::make_shared<simple_selection>(schema, std::move(defs), std::move(metadata), false);
@@ -253,7 +253,7 @@ selection::collect_metadata(schema_ptr schema, const std::vector<::shared_ptr<ra
     return r;
 }
 
-result_set_builder::result_set_builder(const selection& s, db_clock::time_point now, cql_serialization_format sf)
+result_set_builder::result_set_builder(const selection& s, gc_clock::time_point now, cql_serialization_format sf)
     : _result_set(std::make_unique<result_set>(::make_shared<metadata>(*(s.get_result_metadata()))))
     , _selectors(s.new_selectors())
     , _now(now)
@@ -290,7 +290,7 @@ void result_set_builder::add(const column_definition& def, const query::result_a
         gc_clock::duration ttl_left(-1);
         expiry_opt e = c.expiry();
         if (e) {
-            ttl_left = *e - to_gc_clock(_now);
+            ttl_left = *e - _now;
         }
         _ttls[current->size() - 1] = ttl_left.count();
     }
@@ -428,12 +428,6 @@ int32_t result_set_builder::ttl_of(size_t idx) {
 }
 
 bytes_opt result_set_builder::get_value(data_type t, query::result_atomic_cell_view c) {
-    if (t->is_counter()) {
-        fail(unimplemented::cause::COUNTERS);
-#if 0
-                ByteBufferUtil.bytes(CounterContext.instance().total(c.value()))
-#endif
-    }
     return {to_bytes(c.value())};
 }
 

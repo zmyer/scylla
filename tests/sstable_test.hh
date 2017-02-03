@@ -56,7 +56,7 @@ public:
     test(sstable_ptr s) : _sst(s) {}
 
     summary& _summary() {
-        return _sst->_summary;
+        return _sst->_components->summary;
     }
 
     future<temporary_buffer<char>> data_read(uint64_t pos, size_t len) {
@@ -71,7 +71,7 @@ public:
     }
 
     statistics& get_statistics() {
-        return _sst->_statistics;
+        return _sst->_components->statistics;
     }
 
     future<> read_summary() {
@@ -83,7 +83,7 @@ public:
     }
 
     summary& get_summary() {
-        return _sst->_summary;
+        return _sst->_components->summary;
     }
 
     future<> read_toc() {
@@ -91,7 +91,7 @@ public:
     }
 
     auto& get_components() {
-        return _sst->_components;
+        return _sst->_recognized_components;
     }
 
     template <typename T>
@@ -107,9 +107,13 @@ public:
         _sst->_dir = dir;
     }
 
+    void set_data_file_size(uint64_t size) {
+        _sst->_data_file_size = size;
+    }
+
     future<> store() {
-        _sst->_components.erase(sstable::component_type::Index);
-        _sst->_components.erase(sstable::component_type::Data);
+        _sst->_recognized_components.erase(sstable::component_type::Index);
+        _sst->_recognized_components.erase(sstable::component_type::Data);
         return seastar::async([sst = _sst] {
             sst->write_toc(default_priority_class());
             sst->write_statistics(default_priority_class());
@@ -134,16 +138,16 @@ public:
         // leveled strategy sorts sstables by age using max_timestamp, let's set it to 0.
         stats.max_timestamp = max_timestamp;
         stats.sstable_level = sstable_level;
-        _sst->_statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
-        _sst->_summary.first_key.value = bytes(reinterpret_cast<const signed char*>(first_key.c_str()), first_key.size());
-        _sst->_summary.last_key.value = bytes(reinterpret_cast<const signed char*>(last_key.c_str()), last_key.size());
+        _sst->_components->statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
+        _sst->_components->summary.first_key.value = bytes(reinterpret_cast<const signed char*>(first_key.c_str()), first_key.size());
+        _sst->_components->summary.last_key.value = bytes(reinterpret_cast<const signed char*>(last_key.c_str()), last_key.size());
         _sst->set_first_and_last_keys();
     }
 
     void set_values(sstring first_key, sstring last_key, stats_metadata stats) {
-        _sst->_statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
-        _sst->_summary.first_key.value = bytes(reinterpret_cast<const signed char*>(first_key.c_str()), first_key.size());
-        _sst->_summary.last_key.value = bytes(reinterpret_cast<const signed char*>(last_key.c_str()), last_key.size());
+        _sst->_components->statistics.contents[metadata_type::Stats] = std::make_unique<stats_metadata>(std::move(stats));
+        _sst->_components->summary.first_key.value = bytes(reinterpret_cast<const signed char*>(first_key.c_str()), first_key.size());
+        _sst->_components->summary.last_key.value = bytes(reinterpret_cast<const signed char*>(last_key.c_str()), last_key.size());
         _sst->set_first_and_last_keys();
     }
 };
@@ -253,8 +257,8 @@ inline schema_ptr list_schema() {
     return s;
 }
 
-inline schema_ptr uncompressed_schema() {
-    static thread_local auto uncompressed = [] {
+inline schema_ptr uncompressed_schema(int32_t min_index_interval = 0) {
+    auto uncompressed = [=] {
         schema_builder builder(make_lw_shared(schema(generate_legacy_id("ks", "uncompressed"), "ks", "uncompressed",
         // partition key
         {{"name", utf8_type}},
@@ -269,6 +273,10 @@ inline schema_ptr uncompressed_schema() {
         // comment
         "Uncompressed data"
        )));
+       builder.set_compressor_params(compression_parameters({ }));
+       if (min_index_interval) {
+           builder.set_min_index_interval(min_index_interval);
+       }
        return builder.build(schema_builder::compact_storage::no);
     }();
     return uncompressed;
@@ -599,6 +607,9 @@ public:
             : _sst(std::move(sst)), _rd(std::move(rd)) {}
     virtual future<streamed_mutation_opt> operator()() override {
         return _rd.read();
+    }
+    virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+        return _rd.fast_forward_to(pr);
     }
 };
 

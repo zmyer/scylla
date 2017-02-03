@@ -153,7 +153,12 @@ struct summary_ka {
      * Similar to origin off heap size
      */
     uint64_t memory_footprint() const {
-        return sizeof(summary_entry) * entries.size() + sizeof(uint32_t) * positions.size() + sizeof(*this);
+        auto sz = sizeof(summary_entry) * entries.size() + sizeof(uint32_t) * positions.size() + sizeof(*this);
+        sz += first_key.value.size() + last_key.value.size();
+        for (auto& e : entries) {
+            sz += e.key.size();
+        }
+        return sz;
     }
 
     explicit operator bool() const {
@@ -162,36 +167,50 @@ struct summary_ka {
 };
 using summary = summary_ka;
 
+class file_writer;
+
 struct metadata {
     virtual ~metadata() {}
+    virtual uint64_t serialized_size() const = 0;
+    virtual void write(file_writer& write) const = 0;
 };
 
-struct validation_metadata : public metadata {
+template <typename T>
+uint64_t serialized_size(const T& object);
+
+template <class T>
+typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, void>
+write(file_writer& out, const T& t);
+
+// serialized_size() implementation for metadata class
+template <typename Component>
+class metadata_base : public metadata {
+public:
+    virtual uint64_t serialized_size() const override {
+        return sstables::serialized_size(static_cast<const Component&>(*this));
+    }
+    virtual void write(file_writer& writer) const override {
+        return sstables::write(writer, static_cast<const Component&>(*this));
+    }
+};
+
+struct validation_metadata : public metadata_base<validation_metadata> {
     disk_string<uint16_t> partitioner;
     double filter_chance;
-
-    size_t serialized_size() {
-        return sizeof(uint16_t) + partitioner.value.size() + sizeof(filter_chance);
-    }
 
     template <typename Describer>
     auto describe_type(Describer f) { return f(partitioner, filter_chance); }
 };
 
-struct compaction_metadata : public metadata {
+struct compaction_metadata : public metadata_base<compaction_metadata> {
     disk_array<uint32_t, uint32_t> ancestors;
     disk_array<uint32_t, uint8_t> cardinality;
-
-    size_t serialized_size() {
-        return sizeof(uint32_t) + (ancestors.elements.size() * sizeof(uint32_t)) +
-            sizeof(uint32_t) + (cardinality.elements.size() * sizeof(uint8_t));
-    }
 
     template <typename Describer>
     auto describe_type(Describer f) { return f(ancestors, cardinality); }
 };
 
-struct ka_stats_metadata : public metadata {
+struct ka_stats_metadata : public metadata_base<ka_stats_metadata> {
     utils::estimated_histogram estimated_row_size;
     utils::estimated_histogram estimated_column_count;
     db::replay_position position;
@@ -227,6 +246,34 @@ struct ka_stats_metadata : public metadata {
 };
 using stats_metadata = ka_stats_metadata;
 
+struct disk_token_bound {
+    uint8_t exclusive; // really a boolean
+    disk_string<uint16_t> token;
+
+    template <typename Describer>
+    auto describe_type(Describer f) { return f(exclusive, token); }
+};
+
+struct disk_token_range {
+    disk_token_bound left;
+    disk_token_bound right;
+
+    template <typename Describer>
+    auto describe_type(Describer f) { return f(left, right); }
+};
+
+// Scylla-specific sharding information.  This is a set of token
+// ranges that are spanned by this sstable.  When loading the
+// sstable, we can see which shards own data in the sstable by
+// checking each such range.
+struct sharding_metadata {
+    disk_array<uint32_t, disk_token_range> token_ranges;
+
+    template <typename Describer>
+    auto describe_type(Describer f) { return f(token_ranges); }
+};
+
+
 // Numbers are found on disk, so they do matter. Also, setting their sizes of
 // that of an uint32_t is a bit wasteful, but it simplifies the code a lot
 // since we can now still use a strongly typed enum without introducing a
@@ -237,6 +284,19 @@ enum class metadata_type : uint32_t {
     Stats = 2,
 };
 
+
+enum class scylla_metadata_type : uint32_t {
+    Sharding = 1,
+};
+
+struct scylla_metadata {
+    disk_set_of_tagged_union<scylla_metadata_type,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>
+            > data;
+
+    template <typename Describer>
+    auto describe_type(Describer f) { return f(data); }
+};
 
 static constexpr int DEFAULT_CHUNK_SIZE = 65536;
 

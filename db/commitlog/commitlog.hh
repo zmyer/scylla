@@ -94,6 +94,8 @@ using cf_id_type = utils::UUID;
  */
 class commitlog {
 public:
+    using timeout_clock = lowres_clock;
+
     class segment_manager;
     class segment;
 
@@ -171,9 +173,23 @@ public:
     /**
      * Add a "Mutation" to the commit log.
      *
+     * Resolves with timed_out_error when timeout is reached.
+     *
      * @param mutation_func a function that writes 'size' bytes to the log, representing the mutation.
      */
-    future<replay_position> add(const cf_id_type& id, size_t size, serializer_func mutation_func);
+    future<replay_position> add(const cf_id_type& id, size_t size, timeout_clock::time_point timeout, serializer_func mutation_func);
+
+    /**
+     * Template version of add.
+     * Resolves with timed_out_error when timeout is reached.
+     * @param mu an invokable op that generates the serialized data. (Of size bytes)
+     */
+    template<typename _MutationOp>
+    future<replay_position> add_mutation(const cf_id_type& id, size_t size, timeout_clock::time_point timeout, _MutationOp&& mu) {
+        return add(id, size, timeout, [mu = std::forward<_MutationOp>(mu)](output& out) {
+            mu(out);
+        });
+    }
 
     /**
      * Template version of add.
@@ -181,17 +197,15 @@ public:
      */
     template<typename _MutationOp>
     future<replay_position> add_mutation(const cf_id_type& id, size_t size, _MutationOp&& mu) {
-        return add(id, size, [mu = std::forward<_MutationOp>(mu)](output& out) {
-            mu(out);
-        });
+        return add_mutation(id, size, timeout_clock::time_point::max(), std::forward<_MutationOp>(mu));
     }
 
     /**
      * Add an entry to the commit log.
-     *
+     * Resolves with timed_out_error when timeout is reached.
      * @param entry_writer a writer responsible for writing the entry
      */
-    future<replay_position> add_entry(const cf_id_type& id, const commitlog_entry_writer& entry_writer);
+    future<replay_position> add_entry(const cf_id_type& id, const commitlog_entry_writer& entry_writer, timeout_clock::time_point timeout);
 
     /**
      * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position
@@ -241,14 +255,20 @@ public:
      */
     std::vector<sstring> get_active_segment_names() const;
 
+    /**
+     * Returns a vector of segment paths which were
+     * preexisting when this instance of commitlog was created.
+     *
+     * The list will be empty when called for the second time.
+     */
+    std::vector<sstring> get_segments_to_replay();
+
     uint64_t get_total_size() const;
     uint64_t get_completed_tasks() const;
     uint64_t get_flush_count() const;
     uint64_t get_pending_tasks() const;
-    uint64_t get_pending_writes() const;
     uint64_t get_pending_flushes() const;
     uint64_t get_pending_allocations() const;
-    uint64_t get_write_limit_exceeded_count() const;
     uint64_t get_flush_limit_exceeded_count() const;
     uint64_t get_num_segments_created() const;
     uint64_t get_num_segments_destroyed() const;
@@ -321,6 +341,8 @@ private:
 
     struct entry_writer {
         virtual size_t size(segment&) = 0;
+        // Returns segment-independent size of the entry. Must be <= than segment-dependant size.
+        virtual size_t size() = 0;
         virtual void write(segment&, output&) = 0;
     };
 };

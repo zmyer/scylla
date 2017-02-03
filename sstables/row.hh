@@ -66,6 +66,10 @@ public:
             int64_t timestamp,
             int32_t ttl, int32_t expiration) = 0;
 
+    // Consume one counter cell. Column name and value are serialized, and need
+    // to be deserialized according to the schema.
+    virtual proceed consume_counter_cell(bytes_view col_name, bytes_view value,
+            int64_t timestamp) = 0;
 
     // Consume a deleted cell (i.e., a cell tombstone).
     virtual proceed consume_deleted_cell(bytes_view col_name, sstables::deletion_time deltime) = 0;
@@ -79,6 +83,12 @@ public:
     // Returns a flag saying whether the sstable consumer should stop now, or
     // proceed consuming more data.
     virtual proceed consume_row_end() = 0;
+
+    // Called when the reader is fast forwarded.
+    // Clears all partially read data and prepares the consumer for a new
+    // partition. reset() call is always going to be followed by either another
+    // reset() or consume_row_start().
+    virtual void reset() = 0;
 
     // Under which priority class to place I/O coming from this consumer
     virtual const io_priority_class& io_priority() = 0;

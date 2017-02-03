@@ -22,6 +22,8 @@
 #include "storage_service.hh"
 #include "api/api-doc/storage_service.json.hh"
 #include "db/config.hh"
+#include <boost/range/adaptor/map.hpp>
+#include <boost/range/adaptor/filtered.hpp>
 #include <service/storage_service.hh>
 #include <db/commitlog/commitlog.hh>
 #include <gms/gossiper.hh>
@@ -457,8 +459,15 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::get_keyspaces.set(r, [&ctx](const_req req) {
-        auto non_system = req.get_query_param("non_system");
-        return map_keys(ctx.db.local().keyspaces());
+        auto type = req.get_query_param("type");
+        if (type == "user") {
+            return ctx.db.local().get_non_system_keyspaces();
+        } else if (type == "non_local_strategy") {
+            return map_keys(ctx.db.local().get_keyspaces() | boost::adaptors::filtered([](const auto& p) {
+                return p.second.get_replication_strategy().get_type() != locator::replication_strategy_type::local;
+            }));
+        }
+        return map_keys(ctx.db.local().get_keyspaces());
     });
 
     ss::update_snitch.set(r, [](std::unique_ptr<request> req) {
@@ -542,9 +551,7 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::is_joined.set(r, [] (std::unique_ptr<request> req) {
-        return service::get_local_storage_service().is_joined().then([] (bool is_joined) {
-            return make_ready_future<json::json_return_type>(is_joined);
-        });
+        return make_ready_future<json::json_return_type>(service::get_local_storage_service().is_joined());
     });
 
     ss::set_stream_throughput_mb_per_sec.set(r, [](std::unique_ptr<request> req) {
@@ -664,17 +671,23 @@ void set_storage_service(http_context& ctx, routes& r) {
 
     ss::set_trace_probability.set(r, [](std::unique_ptr<request> req) {
         auto probability = req->get_query_param("probability");
-        try {
+        return futurize<json::json_return_type>::apply([probability] {
             double real_prob = std::stod(probability.c_str());
             return tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
                 local_tracing.set_trace_probability(real_prob);
             }).then([] {
                 return make_ready_future<json::json_return_type>(json_void());
             });
-        } catch (...) {
-            throw httpd::bad_param_exception(sprint("Bad format of a probability value: \"%s\"", probability.c_str()));
-        }
-
+        }).then_wrapped([probability] (auto&& f) {
+            try {
+                f.get();
+                return make_ready_future<json::json_return_type>(json_void());
+            } catch (std::out_of_range& e) {
+                throw httpd::bad_param_exception(e.what());
+            } catch (std::invalid_argument&){
+                throw httpd::bad_param_exception(sprint("Bad format in a probability value: \"%s\"", probability.c_str()));
+            }
+        });
     });
 
     ss::get_trace_probability.set(r, [](std::unique_ptr<request> req) {
@@ -684,8 +697,8 @@ void set_storage_service(http_context& ctx, routes& r) {
     ss::get_slow_query_info.set(r, [](const_req req) {
         ss::slow_query_info res;
         res.enable = tracing::tracing::get_local_tracing_instance().slow_query_tracing_enabled();
-        res.ttl = std::chrono::duration_cast<std::chrono::microseconds>(tracing::tracing::get_local_tracing_instance().slow_query_record_ttl()).count() ;
-        res.threshold = std::chrono::duration_cast<std::chrono::microseconds>(tracing::tracing::get_local_tracing_instance().slow_query_threshold()).count();
+        res.ttl = tracing::tracing::get_local_tracing_instance().slow_query_record_ttl().count() ;
+        res.threshold = tracing::tracing::get_local_tracing_instance().slow_query_threshold().count();
         return res;
     });
 

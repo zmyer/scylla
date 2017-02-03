@@ -32,7 +32,9 @@
 #include "utils/serialization.hh"
 #include "combine.hh"
 #include <cmath>
+#include <chrono>
 #include <sstream>
+#include <string>
 #include <regex>
 #include <boost/iterator/transform_iterator.hpp>
 #include <boost/range/adaptor/filtered.hpp>
@@ -42,6 +44,7 @@
 #include <boost/locale/encoding_utf.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "utils/big_decimal.hh"
+#include "utils/date.h"
 
 template<typename T>
 sstring time_point_to_string(const T& tp)
@@ -51,6 +54,8 @@ sstring time_point_to_string(const T& tp)
     return boost::posix_time::to_iso_extended_string(time);
 }
 
+static const char* byte_type_name      = "org.apache.cassandra.db.marshal.ByteType";
+static const char* short_type_name     = "org.apache.cassandra.db.marshal.ShortType";
 static const char* int32_type_name     = "org.apache.cassandra.db.marshal.Int32Type";
 static const char* long_type_name      = "org.apache.cassandra.db.marshal.LongType";
 static const char* ascii_type_name     = "org.apache.cassandra.db.marshal.AsciiType";
@@ -60,6 +65,8 @@ static const char* boolean_type_name   = "org.apache.cassandra.db.marshal.Boolea
 static const char* timeuuid_type_name  = "org.apache.cassandra.db.marshal.TimeUUIDType";
 static const char* timestamp_type_name = "org.apache.cassandra.db.marshal.TimestampType";
 static const char* date_type_name      = "org.apache.cassandra.db.marshal.DateType";
+static const char* simple_date_type_name = "org.apache.cassandra.db.marshal.SimpleDateType";
+static const char* time_type_name      = "org.apache.cassandra.db.marshal.TimeType";
 static const char* uuid_type_name      = "org.apache.cassandra.db.marshal.UUIDType";
 static const char* inet_addr_type_name = "org.apache.cassandra.db.marshal.InetAddressType";
 static const char* double_type_name    = "org.apache.cassandra.db.marshal.DoubleType";
@@ -172,7 +179,12 @@ struct integer_type_impl : simple_type_impl<T> {
     }
     T parse_int(sstring_view s) const {
         try {
-            return boost::lexical_cast<T>(s.begin(), s.size());
+            auto value64 = boost::lexical_cast<int64_t>(s.begin(), s.size());
+            auto value = static_cast<T>(value64);
+            if (value != value64) {
+                throw marshal_exception(sprint("Value out of range for type %s: '%s'", this->name(), s));
+            }
+            return static_cast<T>(value);
         } catch (const boost::bad_lexical_cast& e) {
             throw marshal_exception(sprint("Invalid number format '%s'", s));
         }
@@ -185,6 +197,36 @@ struct integer_type_impl : simple_type_impl<T> {
             return {};
         }
         return to_sstring(compose_value(b));
+    }
+};
+
+struct byte_type_impl : integer_type_impl<int8_t> {
+    byte_type_impl() : integer_type_impl{byte_type_name}
+    { }
+
+    virtual void validate(bytes_view v) const override {
+        if (v.size() != 0 && v.size() != 1) {
+            throw marshal_exception(sprint("Expected 1 byte for a tinyint (%d)", v.size()));
+        }
+    }
+
+    virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
+        return cql3::cql3_type::tinyint;
+    }
+};
+
+struct short_type_impl : integer_type_impl<int16_t> {
+    short_type_impl() : integer_type_impl{short_type_name}
+    { }
+
+    virtual void validate(bytes_view v) const override {
+        if (v.size() != 0 && v.size() != 2) {
+            throw marshal_exception(sprint("Expected 2 bytes for a smallint (%d)", v.size()));
+        }
+    }
+
+    virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
+        return cql3::cql3_type::smallint;
     }
 };
 
@@ -732,6 +774,197 @@ public:
 };
 logging::logger timestamp_type_impl::_logger(timestamp_type_name);
 
+struct simple_date_type_impl : public simple_type_impl<uint32_t> {
+    simple_date_type_impl() : simple_type_impl{simple_date_type_name}
+    { }
+    virtual void serialize(const void* value, bytes::iterator& out) const override {
+        if (!value) {
+            return;
+        }
+        auto&& v1 = from_value(value);
+        if (v1.empty()) {
+            return;
+        }
+        uint32_t v = v1.get();
+        v = net::hton(v);
+        out = std::copy_n(reinterpret_cast<const char*>(&v), sizeof(v), out);
+
+    }
+    virtual size_t serialized_size(const void* value) const override {
+        if (!value || from_value(value).empty()) {
+            return 0;
+        }
+        return 4;
+    }
+    virtual data_value deserialize(bytes_view in) const override {
+        if (in.empty()) {
+            return make_empty();
+        }
+        auto v = read_simple_exactly<uint32_t>(in);
+        return make_value(v);
+    }
+    virtual void validate(bytes_view v) const override {
+        if (v.size() != 0 && v.size() != 4) {
+            throw marshal_exception(sprint("Expected 4 byte long for date (%d)", v.size()));
+        }
+    }
+    virtual bytes from_string(sstring_view s) const override {
+        if (s.empty()) {
+            return bytes();
+        }
+        uint32_t ts = net::hton(days_from_string(s));
+        bytes b(bytes::initialized_later(), sizeof(int32_t));
+        std::copy_n(reinterpret_cast<const int8_t*>(&ts), sizeof(ts), b.begin());
+        return b;
+    }
+    static uint32_t days_from_string(sstring_view s) {
+        std::string str;
+        str.resize(s.size());
+        std::transform(s.begin(), s.end(), str.begin(), ::tolower);
+        char* end;
+        auto v = std::strtoll(s.begin(), &end, 10);
+        if (end == s.begin() + s.size()) {
+            return v;
+        }
+        static std::regex date_re("^(-?\\d+)-(\\d+)-(\\d+)");
+        std::smatch dsm;
+        if (!std::regex_match(str, dsm, date_re)) {
+            throw marshal_exception(sprint("Unable to coerce '%s' to a formatted date (long)", str));
+        }
+        auto t = get_time(dsm);
+        return serialize(str, date::local_days(t).time_since_epoch().count());
+    }
+    static date::year_month_day get_time(const std::smatch& sm) {
+        auto year = boost::lexical_cast<long>(sm[1]);
+        auto month = boost::lexical_cast<unsigned>(sm[2]);
+        auto day = boost::lexical_cast<unsigned>(sm[3]);
+        return date::year_month_day{date::year{year}, date::month{month}, date::day{day}};
+    }
+    static uint32_t serialize(const std::string& input, int64_t days) {
+        if (days < std::numeric_limits<int32_t>::min()) {
+            throw marshal_exception(sprint("Input date %s is less than min supported date -5877641-06-23", input));
+        }
+        if (days > std::numeric_limits<int32_t>::max()) {
+            throw marshal_exception(sprint("Input date %s is greater than max supported date 5881580-07-11", input));
+        }
+        days += 1UL << 31;
+        return static_cast<uint32_t>(days);
+    }
+    virtual sstring to_string(const bytes& b) const override {
+        auto v = deserialize(b);
+        if (v.is_null()) {
+            return "";
+        }
+        date::days days{from_value(v).get() - (1UL << 31)};
+        date::year_month_day ymd{date::local_days{days}};
+        std::ostringstream str;
+        str << ymd;
+        return str.str();
+    }
+    virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
+        return cql3::cql3_type::date;
+    }
+};
+
+struct time_type_impl : public simple_type_impl<int64_t> {
+    time_type_impl() : simple_type_impl{time_type_name}
+    { }
+    virtual void serialize(const void* value, bytes::iterator& out) const override {
+        if (!value) {
+            return;
+        }
+        auto&& v1 = from_value(value);
+        if (v1.empty()) {
+            return;
+        }
+        uint64_t v = v1.get();
+        v = net::hton(v);
+        out = std::copy_n(reinterpret_cast<const char*>(&v), sizeof(v), out);
+    }
+    virtual size_t serialized_size(const void* value) const override {
+        if (!value || from_value(value).empty()) {
+            return 0;
+        }
+        return 8;
+    }
+    virtual data_value deserialize(bytes_view in) const override {
+        if (in.empty()) {
+            return make_empty();
+        }
+        auto v = read_simple_exactly<int64_t>(in);
+        return make_value(v);
+    }
+    virtual void validate(bytes_view v) const override {
+        if (v.size() != 0 && v.size() != 8) {
+            throw marshal_exception(sprint("Expected 8 byte long for time (%d)", v.size()));
+        }
+    }
+    virtual bytes from_string(sstring_view s) const override {
+        if (s.empty()) {
+            return bytes();
+        }
+        int64_t ts = net::hton(parse_time(s));
+        bytes b(bytes::initialized_later(), sizeof(int64_t));
+        std::copy_n(reinterpret_cast<const int8_t*>(&ts), sizeof(ts), b.begin());
+        return b;
+    }
+    static int64_t parse_time(sstring_view s) {
+        static auto format_error = "Timestamp format must be hh:mm:ss[.fffffffff]";
+        auto hours_end = s.find(':');
+        if (hours_end == std::string::npos) {
+            throw marshal_exception(format_error);
+        }
+        int64_t hours = std::stol(s.substr(0, hours_end).to_string());
+        if (hours < 0 || hours >= 24) {
+            throw marshal_exception("Hour out of bounds.");
+        }
+        auto minutes_end = s.find(':', hours_end+1);
+        if (minutes_end == std::string::npos) {
+            throw marshal_exception(format_error);
+        }
+        int64_t minutes = std::stol(s.substr(hours_end + 1, hours_end-minutes_end).to_string());
+        if (minutes < 0 || minutes >= 60) {
+            throw marshal_exception("Minute out of bounds.");
+        }
+        auto seconds_end = s.find('.', minutes_end+1);
+        if (seconds_end == std::string::npos) {
+            seconds_end = s.length();
+        }
+        int64_t seconds = std::stol(s.substr(minutes_end + 1, minutes_end-seconds_end).to_string());
+        if (seconds < 0 || seconds >= 60) {
+            throw marshal_exception("Second out of bounds.");
+        }
+        int64_t nanoseconds = 0;
+        if (seconds_end < s.length()) {
+            nanoseconds = std::stol(s.substr(seconds_end + 1).to_string());
+            nanoseconds *= std::pow(10, 9-(s.length() - (seconds_end + 1)));
+            if (nanoseconds < 0 || nanoseconds >= 1000 * 1000 * 1000) {
+                throw marshal_exception("Nanosecond out of bounds.");
+            }
+        }
+        std::chrono::nanoseconds result{};
+        result += std::chrono::hours(hours);
+        result += std::chrono::minutes(minutes);
+        result += std::chrono::seconds(seconds);
+        result += std::chrono::nanoseconds(nanoseconds);
+        return result.count();
+    }
+    virtual sstring to_string(const bytes& b) const override {
+        auto v = deserialize(b);
+        if (v.is_null()) {
+            return "";
+        }
+        std::chrono::nanoseconds nanoseconds{from_value(v).get()};
+        auto time = date::make_time(nanoseconds);
+        std::ostringstream str;
+        str << time;
+        return str.str();
+    }
+    virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
+        return cql3::cql3_type::time;
+    }
+};
+
 struct uuid_type_impl : concrete_type<utils::UUID> {
     uuid_type_impl() : concrete_type(uuid_type_name) {}
     virtual void serialize(const void* value, bytes::iterator& out) const override {
@@ -1275,7 +1508,7 @@ public:
         return true;
     }
     virtual ::shared_ptr<cql3::cql3_type> as_cql3_type() const override {
-        fail(unimplemented::cause::COUNTERS);
+        return cql3::cql3_type::counter;
     }
     virtual size_t native_value_size() const override {
         fail(unimplemented::cause::COUNTERS);
@@ -1756,7 +1989,7 @@ map_type_impl::to_value(mutation_view mut, cql_serialization_format sf) const {
     std::vector<bytes_view> tmp;
     tmp.reserve(mut.cells.size() * 2);
     for (auto&& e : mut.cells) {
-        if (e.second.is_live(mut.tomb)) {
+        if (e.second.is_live(mut.tomb, false)) {
             tmp.emplace_back(e.first);
             tmp.emplace_back(e.second.value());
         }
@@ -1850,7 +2083,7 @@ bool collection_type_impl::is_any_live(collection_mutation_view cm, tombstone to
         in.remove_prefix(ksize);
         auto vsize = read_simple<uint32_t>(in);
         auto value = atomic_cell_view::from_bytes(read_simple_bytes(in, vsize));
-        if (value.is_live(tomb, now)) {
+        if (value.is_live(tomb, now, false)) {
             return true;
         }
     }
@@ -1919,7 +2152,7 @@ bool collection_type_impl::mutation::compact_and_expire(tombstone base_tomb, gc_
     std::vector<std::pair<bytes, atomic_cell>> survivors;
     for (auto&& name_and_cell : cells) {
         atomic_cell& cell = name_and_cell.second;
-        if (cell.is_covered_by(tomb)) {
+        if (cell.is_covered_by(tomb, false)) {
             continue;
         }
         if (cell.has_expired(query_time)) {
@@ -1954,7 +2187,7 @@ collection_type_impl::serialize_mutation_form(mutation_view mut) {
 collection_mutation
 collection_type_impl::serialize_mutation_form_only_live(mutation_view mut, gc_clock::time_point now) {
     return do_serialize_mutation_form(mut.tomb, mut.cells | boost::adaptors::filtered([t = mut.tomb, now] (auto&& e) {
-        return e.second.is_live(t, now);
+        return e.second.is_live(t, now, false);
     }));
 }
 
@@ -2236,7 +2469,7 @@ set_type_impl::to_value(mutation_view mut, cql_serialization_format sf) const {
     std::vector<bytes_view> tmp;
     tmp.reserve(mut.cells.size());
     for (auto&& e : mut.cells) {
-        if (e.second.is_live(mut.tomb)) {
+        if (e.second.is_live(mut.tomb, false)) {
             tmp.emplace_back(e.first);
         }
     }
@@ -2425,7 +2658,7 @@ list_type_impl::to_value(mutation_view mut, cql_serialization_format sf) const {
     std::vector<bytes_view> tmp;
     tmp.reserve(mut.cells.size());
     for (auto&& e : mut.cells) {
-        if (e.second.is_live(mut.tomb)) {
+        if (e.second.is_live(mut.tomb, false)) {
             tmp.emplace_back(e.second.value());
         }
     }
@@ -2811,6 +3044,8 @@ reversed_type_impl::native_typeid() const {
     return _underlying_type->native_typeid();
 }
 
+thread_local const shared_ptr<const abstract_type> byte_type(make_shared<byte_type_impl>());
+thread_local const shared_ptr<const abstract_type> short_type(make_shared<short_type_impl>());
 thread_local const shared_ptr<const abstract_type> int32_type(make_shared<int32_type_impl>());
 thread_local const shared_ptr<const abstract_type> long_type(make_shared<long_type_impl>());
 thread_local const shared_ptr<const abstract_type> ascii_type(make_shared<ascii_type_impl>());
@@ -2820,6 +3055,8 @@ thread_local const shared_ptr<const abstract_type> boolean_type(make_shared<bool
 thread_local const shared_ptr<const abstract_type> date_type(make_shared<date_type_impl>());
 thread_local const shared_ptr<const abstract_type> timeuuid_type(make_shared<timeuuid_type_impl>());
 thread_local const shared_ptr<const abstract_type> timestamp_type(make_shared<timestamp_type_impl>());
+thread_local const shared_ptr<const abstract_type> simple_date_type(make_shared<simple_date_type_impl>());
+thread_local const shared_ptr<const abstract_type> time_type(make_shared<time_type_impl>());
 thread_local const shared_ptr<const abstract_type> uuid_type(make_shared<uuid_type_impl>());
 thread_local const shared_ptr<const abstract_type> inet_addr_type(make_shared<inet_addr_type_impl>());
 thread_local const shared_ptr<const abstract_type> float_type(make_shared<float_type_impl>());
@@ -2832,6 +3069,8 @@ thread_local const data_type empty_type(make_shared<empty_type_impl>());
 data_type abstract_type::parse_type(const sstring& name)
 {
     static thread_local const std::unordered_map<sstring, data_type> types = {
+        { byte_type_name,      byte_type      },
+        { short_type_name,     short_type     },
         { int32_type_name,     int32_type     },
         { long_type_name,      long_type      },
         { ascii_type_name,     ascii_type     },
@@ -2841,6 +3080,8 @@ data_type abstract_type::parse_type(const sstring& name)
         { date_type_name,      date_type      },
         { timeuuid_type_name,  timeuuid_type  },
         { timestamp_type_name, timestamp_type },
+        { simple_date_type_name, simple_date_type },
+        { time_type_name,      time_type },
         { uuid_type_name,      uuid_type      },
         { inet_addr_type_name, inet_addr_type },
         { float_type_name,     float_type     },
@@ -2887,6 +3128,12 @@ data_value::data_value(const char* v) : data_value(make_new(utf8_type, sstring(v
 }
 
 data_value::data_value(bool v) : data_value(make_new(boolean_type, v)) {
+}
+
+data_value::data_value(int8_t v) : data_value(make_new(byte_type, v)) {
+}
+
+data_value::data_value(int16_t v) : data_value(make_new(short_type, v)) {
 }
 
 data_value::data_value(int32_t v) : data_value(make_new(int32_type, v)) {

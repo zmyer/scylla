@@ -156,6 +156,10 @@ public:
             return new_contains_restriction(db, schema, bound_names, false);
         } else if (_relation_type == operator_type::CONTAINS_KEY) {
             return new_contains_restriction(db, schema, bound_names, true);
+        } else if (_relation_type == operator_type::IS_NOT) {
+            // This case is not supposed to happen: statement_restrictions
+            // constructor does not call this function for views' IS_NOT.
+            throw exceptions::invalid_request_exception(sprint("Unsupported \"IS NOT\" relation: %s", to_string()));
         } else {
             throw exceptions::invalid_request_exception(sprint("Unsupported \"!=\" relation: %s", to_string()));
         }
@@ -215,6 +219,15 @@ public:
      */
     virtual ::shared_ptr<restrictions::restriction> new_contains_restriction(database& db, schema_ptr schema,
         ::shared_ptr<variable_specifications> bound_names, bool isKey) = 0;
+
+    /**
+     * Renames an identifier in this Relation, if applicable.
+     * @param from the old identifier
+     * @param to the new identifier
+     * @return a pointer object, if the old identifier is not in the set of entities that this relation covers;
+     *         otherwise a new Relation with "from" replaced by "to" is returned.
+     */
+    virtual ::shared_ptr<relation> maybe_rename_identifier(const column_identifier::raw& from, column_identifier::raw to) = 0;
 
 protected:
 

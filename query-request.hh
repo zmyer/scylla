@@ -36,18 +36,12 @@ template <typename T>
 using range = wrapping_range<T>;
 
 using ring_position = dht::ring_position;
-using partition_range = range<ring_position>;
 using clustering_range = nonwrapping_range<clustering_key_prefix>;
 
-extern const partition_range full_partition_range;
+extern const dht::partition_range full_partition_range;
 
 inline
-bool is_wrap_around(const query::partition_range& range, const schema& s) {
-    return range.is_wrap_around(dht::ring_position_comparator(s));
-}
-
-inline
-bool is_single_partition(const query::partition_range& range) {
+bool is_single_partition(const dht::partition_range& range) {
     return range.is_singular() && range.start()->value().has_key();
 }
 
@@ -99,7 +93,8 @@ constexpr auto max_rows = std::numeric_limits<uint32_t>::max();
 // Schema-dependent.
 class partition_slice {
 public:
-    enum class option { send_clustering_key, send_partition_key, send_timestamp, send_expiry, reversed, distinct, collections_as_maps, send_ttl };
+    enum class option { send_clustering_key, send_partition_key, send_timestamp, send_expiry, reversed, distinct, collections_as_maps, send_ttl,
+                        allow_short_read, };
     using option_set = enum_set<super_enum<option,
         option::send_clustering_key,
         option::send_partition_key,
@@ -108,7 +103,8 @@ public:
         option::reversed,
         option::distinct,
         option::collections_as_maps,
-        option::send_ttl>>;
+        option::send_ttl,
+        option::allow_short_read>>;
     clustering_row_ranges _row_ranges;
 public:
     std::vector<column_id> static_columns; // TODO: consider using bitmap

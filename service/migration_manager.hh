@@ -46,6 +46,7 @@
 #include "db/schema_tables.hh"
 #include "core/distributed.hh"
 #include "gms/inet_address.hh"
+#include "message/messaging_service_fwd.hh"
 #include "utils/UUID.hh"
 
 #include <vector>
@@ -73,21 +74,24 @@ public:
 
     // Fetches schema from remote node and applies it locally.
     // Differs from submit_migration_task() in that all errors are propagated.
-    future<> merge_schema_from(net::messaging_service::msg_addr);
+    future<> merge_schema_from(net::msg_addr);
 
     // Merge mutations received from src.
     // Keep mutations alive around whole async operation.
-    future<> merge_schema_from(net::messaging_service::msg_addr src, const std::vector<frozen_mutation>& mutations);
+    future<> merge_schema_from(net::msg_addr src, const std::vector<frozen_mutation>& mutations);
 
     future<> notify_create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
     future<> notify_create_column_family(const schema_ptr& cfm);
     future<> notify_create_user_type(const user_type& type);
+    future<> notify_create_view(const view_ptr& view);
     future<> notify_update_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
     future<> notify_update_column_family(const schema_ptr& cfm, bool columns_changed);
     future<> notify_update_user_type(const user_type& type);
+    future<> notify_update_view(const view_ptr& view, bool columns_changed);
     future<> notify_drop_keyspace(const sstring& ks_name);
     future<> notify_drop_column_family(const schema_ptr& cfm);
     future<> notify_drop_user_type(const user_type& type);
+    future<> notify_drop_view(const view_ptr& view);
 
     bool should_pull_schema_from(const gms::inet_address& endpoint);
 
@@ -112,6 +116,12 @@ public:
     future<> announce_column_family_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false);
 
     future<> announce_type_drop(user_type dropped_type, bool announce_locally = false);
+
+    future<> announce_new_view(view_ptr view, bool announce_locally = false);
+
+    future<> announce_view_update(view_ptr view, bool announce_locally = false);
+
+    future<> announce_view_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false);
 
     /**
      * actively announce a new version to active hosts via rpc
@@ -149,16 +159,16 @@ inline migration_manager& get_local_migration_manager() {
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // Doesn't affect current node's schema in any way.
-future<schema_ptr> get_schema_definition(table_schema_version, net::messaging_service::msg_addr from);
+future<schema_ptr> get_schema_definition(table_schema_version, net::msg_addr from);
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // The returned schema may not be synchronized. See schema::is_synced().
 // Intended to be used in the read path.
-future<schema_ptr> get_schema_for_read(table_schema_version, net::messaging_service::msg_addr from);
+future<schema_ptr> get_schema_for_read(table_schema_version, net::msg_addr from);
 
 // Returns schema of given version, either from cache or from remote node identified by 'from'.
 // Ensures that this node is synchronized with the returned schema. See schema::is_synced().
 // Intended to be used in the write path, which relies on synchronized schema.
-future<schema_ptr> get_schema_for_write(table_schema_version, net::messaging_service::msg_addr from);
+future<schema_ptr> get_schema_for_write(table_schema_version, net::msg_addr from);
 
 }

@@ -50,12 +50,14 @@
 #include "service/priority_manager.hh"
 #include <boost/range/irange.hpp>
 #include "service/storage_service.hh"
+#include <boost/icl/interval.hpp>
+#include <boost/icl/interval_set.hpp>
 
 namespace streaming {
 
 extern logging::logger sslog;
 
-stream_transfer_task::stream_transfer_task(shared_ptr<stream_session> session, UUID cf_id, std::vector<range<dht::token>> ranges, long total_size)
+stream_transfer_task::stream_transfer_task(shared_ptr<stream_session> session, UUID cf_id, dht::token_range_vector ranges, long total_size)
     : stream_task(session, cf_id)
     , _ranges(std::move(ranges))
     , _total_size(total_size) {
@@ -67,21 +69,24 @@ struct send_info {
     database& db;
     utils::UUID plan_id;
     utils::UUID cf_id;
-    query::partition_range pr;
+    dht::partition_range_vector prs;
     net::messaging_service::msg_addr id;
     uint32_t dst_cpu_id;
     size_t mutations_nr{0};
     semaphore mutations_done{0};
     bool error_logged = false;
+    mutation_reader reader;
     send_info(database& db_, utils::UUID plan_id_, utils::UUID cf_id_,
-              query::partition_range pr_, net::messaging_service::msg_addr id_,
+              dht::partition_range_vector prs_, net::messaging_service::msg_addr id_,
               uint32_t dst_cpu_id_)
         : db(db_)
         , plan_id(plan_id_)
         , cf_id(cf_id_)
-        , pr(pr_)
+        , prs(std::move(prs_))
         , id(id_)
         , dst_cpu_id(dst_cpu_id_) {
+        auto& cf = db.find_column_family(this->cf_id);
+        reader = cf.make_streaming_reader(cf.schema(), this->prs);
     }
 };
 
@@ -108,24 +113,21 @@ future<> do_send_mutations(auto si, auto fm, bool fragmented) {
 }
 
 future<> send_mutations(auto si) {
-    auto& cf = si->db.find_column_family(si->cf_id);
-    return do_with(cf.make_streaming_reader(cf.schema(), si->pr), [si] (auto& reader) {
-        return repeat([si, &reader] () {
-            return reader().then([si] (auto smopt) {
-                if (smopt && si->db.column_family_exists(si->cf_id)) {
-                    size_t fragment_size = default_frozen_fragment_size;
-                    // Mutations cannot be sent fragmented if the receiving side doesn't support that.
-                    if (!service::get_local_storage_service().cluster_supports_large_partitions()) {
-                        fragment_size = std::numeric_limits<size_t>::max();
-                    }
-                    return fragment_and_freeze(std::move(*smopt), [si] (auto fm, bool fragmented) {
-                        si->mutations_nr++;
-                        return do_send_mutations(si, std::move(fm), fragmented);
-                    }, fragment_size).then([] { return stop_iteration::no; });
-                } else {
-                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+    return repeat([si] () {
+        return si->reader().then([si] (auto smopt) {
+            if (smopt && si->db.column_family_exists(si->cf_id)) {
+                size_t fragment_size = default_frozen_fragment_size;
+                // Mutations cannot be sent fragmented if the receiving side doesn't support that.
+                if (!service::get_local_storage_service().cluster_supports_large_partitions()) {
+                    fragment_size = std::numeric_limits<size_t>::max();
                 }
-            });
+                return fragment_and_freeze(std::move(*smopt), [si] (auto fm, bool fragmented) {
+                    si->mutations_nr++;
+                    return do_send_mutations(si, std::move(fm), fragmented);
+                }, fragment_size).then([] { return stop_iteration::no; });
+            } else {
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
         });
     }).then([si] {
         return si->mutations_done.wait(si->mutations_nr);
@@ -135,24 +137,18 @@ future<> send_mutations(auto si) {
 void stream_transfer_task::start() {
     auto plan_id = session->plan_id();
     auto cf_id = this->cf_id;
+    auto dst_cpu_id = session->dst_cpu_id;
+    auto& schema = session->get_local_db().find_column_family(cf_id).schema();
     auto id = net::messaging_service::msg_addr{session->peer, session->dst_cpu_id};
     sslog.debug("[Stream #{}] stream_transfer_task: cf_id={}", plan_id, cf_id);
-    do_for_each(_ranges.begin(), _ranges.end(), [this, plan_id, cf_id, id] (auto range) {
-        unsigned shard_begin = range.start() ? dht::shard_of(range.start()->value()) : 0;
-        unsigned shard_end = range.end() ? dht::shard_of(range.end()->value()) + 1 : smp::count;
-        auto cf_id = this->cf_id;
-        auto dst_cpu_id = this->session->dst_cpu_id;
-        auto pr = dht::to_partition_range(range);
-        auto shard_range = boost::irange<unsigned>(shard_begin, shard_end);
-        sslog.debug("[Stream #{}] stream_transfer_task: cf_id={}, shard_begin={} shard_end={}", plan_id, cf_id, shard_begin, shard_end);
-        return parallel_for_each(shard_range.begin(), shard_range.end(),
-                [this, plan_id, cf_id, id, dst_cpu_id, pr] (unsigned shard) {
-            sslog.debug("[Stream #{}] stream_transfer_task: cf_id={}, invoke_on shard={}", plan_id, cf_id, shard);
-            return this->session->get_db().invoke_on(shard, [plan_id, cf_id, id, dst_cpu_id, pr] (database& db) {
-                // Send mutations on related shards, do not capture this
-                auto si = make_lw_shared<send_info>(db, plan_id, cf_id, pr, id, dst_cpu_id);
-                return send_mutations(si);
-            });
+    sort_and_merge_ranges();
+    _shard_ranges = dht::split_ranges_to_shards(_ranges, *schema);
+    parallel_for_each(_shard_ranges, [this, dst_cpu_id, plan_id, cf_id, id] (auto& item) {
+        auto& shard = item.first;
+        auto& prs = item.second;
+        return session->get_db().invoke_on(shard, [plan_id, cf_id, id, dst_cpu_id, prs = std::move(prs)] (database& db) mutable {
+            auto si = make_lw_shared<send_info>(db, plan_id, cf_id, prs, id, dst_cpu_id);
+            return send_mutations(std::move(si));
         });
     }).then([this, plan_id, cf_id, id] {
         sslog.debug("[Stream #{}] SEND STREAM_MUTATION_DONE to {}, cf_id={}", plan_id, id, cf_id);
@@ -171,8 +167,27 @@ void stream_transfer_task::start() {
     });
 }
 
-void stream_transfer_task::append_ranges(const std::vector<range<dht::token>>& ranges) {
+void stream_transfer_task::append_ranges(const dht::token_range_vector& ranges) {
     _ranges.insert(_ranges.end(), ranges.begin(), ranges.end());
+}
+
+void stream_transfer_task::sort_and_merge_ranges() {
+    boost::icl::interval_set<dht::token> myset;
+    dht::token_range_vector ranges;
+    sslog.debug("cf_id = {}, before ranges = {}, size={}", cf_id, _ranges, _ranges.size());
+    _ranges.swap(ranges);
+    for (auto& range : ranges) {
+        // TODO: We should convert range_to_interval and interval_to_range to
+        // take nonwrapping_range ranges.
+        myset += locator::token_metadata::range_to_interval(range);
+    }
+    ranges.clear();
+    ranges.shrink_to_fit();
+    for (auto& i : myset) {
+        auto r = locator::token_metadata::interval_to_range(i);
+        _ranges.push_back(dht::token_range(r));
+    }
+    sslog.debug("cf_id = {}, after  ranges = {}, size={}", cf_id, _ranges, _ranges.size());
 }
 
 } // namespace streaming

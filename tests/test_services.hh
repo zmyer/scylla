@@ -25,6 +25,7 @@
 #include <seastar/core/distributed.hh>
 #include <seastar/core/thread.hh>
 #include "service/storage_service.hh"
+#include "message/messaging_service.hh"
 
 class storage_service_for_tests {
     distributed<database> _db;
@@ -34,6 +35,9 @@ public:
         assert(thread);
         net::get_messaging_service().start(gms::inet_address("127.0.0.1")).get();
         service::get_storage_service().start(std::ref(_db)).get();
+        service::get_storage_service().invoke_on_all([] (auto& ss) {
+            ss.enable_all_features();
+        }).get();
     }
     ~storage_service_for_tests() {
         service::get_storage_service().stop().get();

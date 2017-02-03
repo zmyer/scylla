@@ -8,7 +8,9 @@ fi
 print_usage() {
     echo "build_ami.sh --localrpm --repo [URL]"
     echo "  --localrpm  deploy locally built rpms"
-    echo "  --repo  specify .repo/.list file URL"
+    echo "  --repo  repository for both install and update, specify .repo/.list file URL"
+    echo "  --repo-for-install  repository for install, specify .repo/.list file URL"
+    echo "  --repo-for-update  repository for update, specify .repo/.list file URL"
     exit 1
 }
 LOCALRPM=0
@@ -24,6 +26,14 @@ while [ $# -gt 0 ]; do
             INSTALL_ARGS="$INSTALL_ARGS --repo $2"
             shift 2
             ;;
+        "--repo-for-install")
+            INSTALL_ARGS="$INSTALL_ARGS --repo-for-install $2"
+            shift 2
+            ;;
+        "--repo-for-update")
+            INSTALL_ARGS="$INSTALL_ARGS --repo-for-update $2"
+            shift 2
+            ;;
         *)
             print_usage
             ;;
@@ -33,7 +43,7 @@ done
 . /etc/os-release
 case "$ID" in
     "centos")
-        AMI=ami-f3102499
+        AMI=ami-46bf8a51
         REGION=us-east-1
         SSH_USERNAME=centos
         ;;
@@ -94,7 +104,7 @@ if [ $LOCALRPM -eq 1 ]; then
             cd build
             git clone --depth 1 https://github.com/scylladb/scylla-jmx.git
             cd scylla-jmx
-            sh -x -e dist/ubuntu/build_deb.sh $*
+            sh -x -e dist/debian/build_deb.sh $*
             cd ../..
             cp build/scylla-jmx_`cat build/scylla-jmx/build/SCYLLA-VERSION-FILE | sed 's/\.rc/~rc/'`-`cat build/scylla-jmx/build/SCYLLA-RELEASE-FILE`-ubuntu1_all.deb dist/ami/files/scylla-jmx_all.deb
         fi
@@ -102,7 +112,7 @@ if [ $LOCALRPM -eq 1 ]; then
             cd build
             git clone --depth 1 https://github.com/scylladb/scylla-tools-java.git
             cd scylla-tools-java
-            sh -x -e dist/ubuntu/build_deb.sh $*
+            sh -x -e dist/debian/build_deb.sh $*
             cd ../..
             cp build/scylla-tools_`cat build/scylla-tools-java/build/SCYLLA-VERSION-FILE | sed 's/\.rc/~rc/'`-`cat build/scylla-tools-java/build/SCYLLA-RELEASE-FILE`-ubuntu1_all.deb dist/ami/files/scylla-tools_all.deb
         fi
@@ -117,7 +127,7 @@ if [ ! -f variables.json ]; then
 fi
 
 if [ ! -d packer ]; then
-    wget https://releases.hashicorp.com/packer/0.8.6/packer_0.8.6_linux_amd64.zip
+    wget -nv https://releases.hashicorp.com/packer/0.8.6/packer_0.8.6_linux_amd64.zip
     mkdir packer
     cd packer
     unzip -x ../packer_0.8.6_linux_amd64.zip

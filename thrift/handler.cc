@@ -52,7 +52,6 @@
 #include <boost/range/adaptor/indirected.hpp>
 #include "query-result-reader.hh"
 #include "thrift/server.hh"
-#include "db/size_estimates_recorder.hh"
 
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
@@ -259,6 +258,11 @@ public:
                         cl_from_thrift(consistency_level),
                         nullptr).then([schema, cmd, cell_limit](auto result) {
                     return query::result_view::do_with(*result, [schema, cmd, cell_limit](query::result_view v) {
+                        if (schema->is_counter()) {
+                            counter_column_aggregator aggregator(*schema, cmd->slice, cell_limit);
+                            v.consume(cmd->slice, aggregator);
+                            return aggregator.release_as_map();
+                        }
                         column_aggregator aggregator(*schema, cmd->slice, cell_limit);
                         v.consume(cmd->slice, aggregator);
                         return aggregator.release_as_map();
@@ -332,7 +336,7 @@ public:
         });
     }
 
-    static lw_shared_ptr<query::read_command> make_paged_read_cmd(const schema& s, uint32_t column_limit, const std::string* start_column, const std::vector<query::partition_range>& range) {
+    static lw_shared_ptr<query::read_command> make_paged_read_cmd(const schema& s, uint32_t column_limit, const std::string* start_column, const dht::partition_range_vector& range) {
         auto opts = query_opts(s);
         std::vector<query::clustering_range> clustering_ranges;
         std::vector<column_id> regular_columns;
@@ -370,7 +374,7 @@ public:
     static future<> do_get_paged_slice(
             schema_ptr schema,
             uint32_t column_limit,
-            std::vector<query::partition_range> range,
+            dht::partition_range_vector range,
             const std::string* start_column,
             db::consistency_level consistency_level,
             std::vector<KeySlice>& output) {
@@ -381,7 +385,7 @@ public:
             // For static CFs, we must first query for a specific key so as to consume the remainder
             // of columns in that partition.
             start_key = range[0].start()->value().key();
-            range = {query::partition_range::make_singular(std::move(range[0].start()->value()))};
+            range = {dht::partition_range::make_singular(std::move(range[0].start()->value()))};
         }
         auto range1 = range; // query() below accepts an rvalue, so need a copy to reuse later
         return service::get_local_storage_proxy().query(schema, cmd, std::move(range), consistency_level, nullptr).then([schema, cmd, column_limit](auto result) {
@@ -406,7 +410,7 @@ public:
                 start_key = key_from_thrift(*schema, to_bytes_view(output.back().key));
             }
             auto start = dht::global_partitioner().decorate_key(*schema, std::move(*start_key));
-            range[0] = query::partition_range(query::partition_range::bound(std::move(start), false), std::move(end));
+            range[0] = dht::partition_range(dht::partition_range::bound(std::move(start), false), std::move(end));
             return do_get_paged_slice(schema, column_limit - columns, std::move(range), nullptr, consistency_level, output);
         });
     }
@@ -452,6 +456,10 @@ public:
                 fail(unimplemented::cause::SUPER);
             }
 
+            if (schema->is_view()) {
+                throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
+            }
+
             mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
             add_to_mutation(*schema, column, m_to_apply);
             return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
@@ -461,9 +469,17 @@ public:
     }
 
     void add(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnParent& column_parent, const CounterColumn& column, const ConsistencyLevel::type consistency_level) {
-        warn(unimplemented::cause::COUNTERS);
-        // FIXME: implement
-        return pass_unimplemented(exn_cob);
+        with_schema(std::move(cob), std::move(exn_cob), column_parent.column_family, [&](schema_ptr schema) {
+            if (column_parent.__isset.super_column) {
+                fail(unimplemented::cause::SUPER);
+            }
+
+            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+            add_to_mutation(*schema, column, m_to_apply);
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+            });
+        });
     }
 
     void cas(tcxx::function<void(CASResult const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const std::string& column_family, const std::vector<Column> & expected, const std::vector<Column> & updates, const ConsistencyLevel::type serial_consistency_level, const ConsistencyLevel::type commit_consistency_level) {
@@ -475,6 +491,10 @@ public:
 
     void remove(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const int64_t timestamp, const ConsistencyLevel::type consistency_level) {
         with_schema(std::move(cob), std::move(exn_cob), column_path.column_family, [&](schema_ptr schema) {
+            if (schema->is_view()) {
+                throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
+            }
+
             mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
 
             if (column_path.__isset.super_column) {
@@ -496,10 +516,29 @@ public:
         });
     }
 
-    void remove_counter(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& path, const ConsistencyLevel::type consistency_level) {
-        warn(unimplemented::cause::COUNTERS);
-        // FIXME: implement
-        return pass_unimplemented(exn_cob);
+    void remove_counter(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& key, const ColumnPath& column_path, const ConsistencyLevel::type consistency_level) {
+        with_schema(std::move(cob), std::move(exn_cob), column_path.column_family, [&](schema_ptr schema) {
+            mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key)), schema);
+
+            auto timestamp = api::new_timestamp();
+            if (column_path.__isset.super_column) {
+                fail(unimplemented::cause::SUPER);
+            } else if (column_path.__isset.column) {
+                Deletion d;
+                d.__set_timestamp(timestamp);
+                d.__set_predicate(column_path_to_slice_predicate(column_path));
+                Mutation m;
+                m.__set_deletion(d);
+                add_to_mutation(*schema, m, m_to_apply);
+            } else {
+                m_to_apply.partition().apply(tombstone(timestamp, gc_clock::now()));
+            }
+
+            return _query_state.get_client_state().has_schema_access(*schema, auth::permission::MODIFY).then([m_to_apply = std::move(m_to_apply), consistency_level] {
+                // This mutation contains only counter tombstones so it can be applied like non-counter mutations.
+                return service::get_local_storage_proxy().mutate({std::move(m_to_apply)}, cl_from_thrift(consistency_level), nullptr);
+            });
+        });
     }
 
     void batch_mutate(tcxx::function<void()> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::map<std::string, std::map<std::string, std::vector<Mutation> > > & mutation_map, const ConsistencyLevel::type consistency_level) {
@@ -531,6 +570,9 @@ public:
             }
 
             return _query_state.get_client_state().has_column_family_access(current_keyspace(), cfname, auth::permission::MODIFY).then([=] {
+                if (_db.local().find_schema(current_keyspace(), cfname)->is_view()) {
+                    throw make_exception<InvalidRequestException>("Cannot truncate Materialized Views");
+                }
                 return service::get_local_storage_proxy().truncate_blocking(current_keyspace(), cfname);
             });
         });
@@ -592,7 +634,7 @@ public:
                 return service::get_local_storage_proxy().query(
                         schema,
                         cmd,
-                        {query::partition_range::make_singular(dk)},
+                        {dht::partition_range::make_singular(dk)},
                         cl_from_thrift(cl),
                         nullptr).then([schema, cmd, column_limit](auto result) {
                     return query::result_view::do_with(*result, [schema, cmd, column_limit](query::result_view v) {
@@ -721,50 +763,26 @@ public:
         return cob("dummy trace");
     }
 
-    static std::vector<CfSplit> to_cf_splits(std::vector<db::system_keyspace::range_estimates> estimates, int32_t keys_per_split) {
-        std::vector<CfSplit> splits;
-        if (estimates.empty()) {
-            return splits;
-        }
-        auto&& acc = estimates[0];
-        auto emplace_acc = [&] {
-        splits.emplace_back();
-            auto start_token = dht::global_partitioner().to_sstring(acc.range_start_token);
-            auto end_token = dht::global_partitioner().to_sstring(acc.range_end_token);
-            splits.back().__set_start_token(bytes_to_string(to_bytes_view(start_token)));
-            splits.back().__set_end_token(bytes_to_string(to_bytes_view(end_token)));
-            splits.back().__set_row_count(acc.partitions_count);
-        };
-        for (auto&& e : estimates | boost::adaptors::sliced(1, estimates.size())) {
-            if (acc.partitions_count + e.partitions_count > keys_per_split) {
-                emplace_acc();
-                acc = std::move(e);
-            } else {
-                acc.range_end_token = std::move(e.range_end_token);
-                acc.partitions_count += e.partitions_count;
-            }
-        }
-        emplace_acc();
-        return splits;
-    }
-
     void describe_splits_ex(tcxx::function<void(std::vector<CfSplit>  const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& cfName, const std::string& start_token, const std::string& end_token, const int32_t keys_per_split) {
         with_cob(std::move(cob), std::move(exn_cob), [&]{
+            dht::token_range_vector ranges;
             auto tstart = start_token.empty() ? dht::minimum_token() : dht::global_partitioner().from_sstring(sstring(start_token));
             auto tend = end_token.empty() ? dht::maximum_token() : dht::global_partitioner().from_sstring(sstring(end_token));
+            range<dht::token> r({{ std::move(tstart), false }}, {{ std::move(tend), true }});
             auto cf = sstring(cfName);
-            auto f = db::system_keyspace::query_size_estimates(current_keyspace(), cf, tstart, tend);
-            return f.then([this, keys_per_split, cf = std::move(cf), tstart = std::move(tstart), tend = std::move(tend)](auto&& estimates) {
-                if (!estimates.empty()) {
-                    return make_ready_future<std::vector<CfSplit>>(to_cf_splits(std::move(estimates), keys_per_split));
-                }
-                return db::get_local_size_estimates_recorder().record_size_estimates()
-                    .then([this, keys_per_split, cf = std::move(cf), tstart = std::move(tstart), tend = std::move(tend)]() {
-                        return db::system_keyspace::query_size_estimates(this->current_keyspace(), std::move(cf), std::move(tstart), std::move(tend)).then([keys_per_split](auto&& estimates) {
-                            return to_cf_splits(std::move(estimates), keys_per_split);
-                        });
-                    });
-            });
+            auto splits = service::get_local_storage_service().get_splits(current_keyspace(), cf, std::move(r), keys_per_split);
+
+            std::vector<CfSplit> res;
+            for (auto&& s : splits) {
+                res.emplace_back();
+                assert(s.first.start() && s.first.end());
+                auto start_token = dht::global_partitioner().to_sstring(s.first.start()->value());
+                auto end_token = dht::global_partitioner().to_sstring(s.first.end()->value());
+                res.back().__set_start_token(bytes_to_string(to_bytes_view(start_token)));
+                res.back().__set_end_token(bytes_to_string(to_bytes_view(end_token)));
+                res.back().__set_row_count(s.second);
+            }
+            return res;
         });
     }
 
@@ -785,10 +803,16 @@ public:
             });
         });
     }
-
     void system_drop_column_family(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             return _query_state.get_client_state().has_column_family_access(current_keyspace(), column_family, auth::permission::DROP).then([=] {
+                auto& cf = _db.local().find_column_family(current_keyspace(), column_family);
+                if (cf.schema()->is_view()) {
+                    throw make_exception<InvalidRequestException>("Cannot drop Materialized Views from Thrift");
+                }
+                if (!cf.views().empty()) {
+                    throw make_exception<InvalidRequestException>("Cannot drop table with Materialized Views %s", column_family);
+                }
                 return service::get_local_migration_manager().announce_column_family_drop(current_keyspace(), column_family, false).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
@@ -844,10 +868,21 @@ public:
 
     void system_update_column_family(tcxx::function<void(std::string const& _return)> cob, tcxx::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const CfDef& cf_def) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
-            auto schema = _db.local().find_schema(cf_def.keyspace, cf_def.name);
+            auto& cf = _db.local().find_column_family(cf_def.keyspace, cf_def.name);
+            auto schema = cf.schema();
 
             if (schema->is_cql3_table()) {
                 throw make_exception<InvalidRequestException>("Cannot modify CQL3 table {} as it may break the schema. You should use cqlsh to modify CQL3 tables instead.", cf_def.name);
+            }
+
+            if (schema->is_view()) {
+                throw make_exception<InvalidRequestException>("Cannot modify Materialized View table %s as it may break the schema. "
+                                                              "You should use cqlsh to modify Materialized View tables instead.", cf_def.name);
+            }
+
+            if (!cf.views().empty()) {
+                throw make_exception<InvalidRequestException>("Cannot modify table with Materialized Views %s as it may break the schema. "
+                                                              "You should use cqlsh to modify Materialized View tables instead.", cf_def.name);
             }
 
             auto s = schema_from_thrift(cf_def, cf_def.keyspace, schema->id());
@@ -897,7 +932,7 @@ public:
             if (compression != Compression::type::NONE) {
                 throw make_exception<InvalidRequestException>("Compressed query strings are not supported");
             }
-            auto opts = std::make_unique<cql3::query_options>(cl_from_thrift(consistency), stdx::nullopt, std::vector<bytes_view_opt>(),
+            auto opts = std::make_unique<cql3::query_options>(cl_from_thrift(consistency), stdx::nullopt, std::vector<cql3::raw_value_view>(),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
             auto f = _query_processor.local().process(query, _query_state, *opts);
             return f.then([cob = std::move(cob), opts = std::move(opts)](auto&& ret) {
@@ -964,9 +999,9 @@ public:
             if (stmt->get_bound_terms() != values.size()) {
                 throw make_exception<InvalidRequestException>("Wrong number of values specified. Expected %d, got %d.", stmt->get_bound_terms(), values.size());
             }
-            std::vector<bytes_opt> bytes_values;
+            std::vector<cql3::raw_value> bytes_values;
             std::transform(values.begin(), values.end(), std::back_inserter(bytes_values), [](auto&& s) {
-                return to_bytes(s);
+                return cql3::raw_value::make_value(to_bytes(s));
             });
             auto opts = std::make_unique<cql3::query_options>(cl_from_thrift(consistency), stdx::nullopt, std::move(bytes_values),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
@@ -1069,8 +1104,7 @@ private:
         def.__set_strategy_class(meta->strategy_name());
         def.__set_strategy_options(make_options(meta->strategy_options()));
         std::vector<CfDef> cfs;
-        for (auto&& cf : meta->cf_meta_data()) {
-            auto&& s = cf.second;
+        for (auto&& s : meta->tables()) {
             if (s->is_cql3_table()) {
                 continue;
             }
@@ -1360,8 +1394,10 @@ private:
     }
     static query::partition_slice::option_set query_opts(const schema& s) {
         query::partition_slice::option_set opts;
-        opts.set(query::partition_slice::option::send_timestamp);
-        opts.set(query::partition_slice::option::send_ttl);
+        if (!s.is_counter()) {
+            opts.set(query::partition_slice::option::send_timestamp);
+            opts.set(query::partition_slice::option::send_ttl);
+        }
         if (s.thrift().is_dynamic()) {
             opts.set(query::partition_slice::option::send_clustering_key);
         }
@@ -1432,12 +1468,12 @@ private:
         }
         return ret;
     }
-    static std::vector<query::partition_range> make_partition_ranges(const schema& s, const std::vector<std::string>& keys) {
-        std::vector<query::partition_range> ranges;
+    static dht::partition_range_vector make_partition_ranges(const schema& s, const std::vector<std::string>& keys) {
+        dht::partition_range_vector ranges;
         for (auto&& key : keys) {
             auto pk = key_from_thrift(s, to_bytes_view(key));
             auto dk = dht::global_partitioner().decorate_key(s, pk);
-            ranges.emplace_back(query::partition_range::make_singular(std::move(dk)));
+            ranges.emplace_back(dht::partition_range::make_singular(std::move(dk)));
         }
         return ranges;
     }
@@ -1459,6 +1495,20 @@ private:
     static ColumnOrSuperColumn make_column_or_supercolumn(const bytes& col, const query::result_atomic_cell_view& cell) {
         return column_to_column_or_supercolumn(make_column(col, cell));
     }
+    static CounterColumn make_counter_column(const bytes& col, const query::result_atomic_cell_view& cell) {
+        CounterColumn ret;
+        ret.__set_name(bytes_to_string(col));
+        ret.__set_value(value_cast<int64_t>(long_type->deserialize_value(cell.value())));
+        return ret;
+    }
+    static ColumnOrSuperColumn counter_column_to_column_or_supercolumn(CounterColumn&& col) {
+        ColumnOrSuperColumn ret;
+        ret.__set_counter_column(std::move(col));
+        return ret;
+    }
+    static ColumnOrSuperColumn make_counter_column_or_supercolumn(const bytes& col, const query::result_atomic_cell_view& cell) {
+        return counter_column_to_column_or_supercolumn(make_counter_column(col, cell));
+    }
     static std::string partition_key_to_string(const schema& s, const partition_key& key) {
         return bytes_to_string(to_legacy(*s.partition_key_type(), key));
     }
@@ -1474,12 +1524,13 @@ private:
     class column_visitor : public Aggregator {
         const schema& _s;
         const query::partition_slice& _slice;
-        uint32_t _cell_limit;
+        const uint32_t _cell_limit;
+        uint32_t _current_cell_limit;
         std::vector<std::pair<std::string, typename Aggregator::type>> _aggregation;
         typename Aggregator::type* _current_aggregation;
     public:
         column_visitor(const schema& s, const query::partition_slice& slice, uint32_t cell_limit)
-                : _s(s), _slice(slice), _cell_limit(cell_limit)
+                : _s(s), _slice(slice), _cell_limit(cell_limit), _current_cell_limit(0)
         { }
         std::vector<std::pair<std::string, typename Aggregator::type>>&& release() {
             return std::move(_aggregation);
@@ -1492,6 +1543,7 @@ private:
         void accept_new_partition(const partition_key& key, uint32_t row_count) {
             _aggregation.emplace_back(partition_key_to_string(_s, key), typename Aggregator::type());
             _current_aggregation = &_aggregation.back().second;
+            _current_cell_limit = _cell_limit;
         }
         void accept_new_partition(uint32_t row_count) {
             // We always ask for the partition_key to be sent in query_opts().
@@ -1500,19 +1552,19 @@ private:
         void accept_new_row(const clustering_key_prefix& key, const query::result_row_view& static_row, const query::result_row_view& row) {
             auto it = row.iterator();
             auto cell = it.next_atomic_cell();
-            if (cell && _cell_limit > 0) {
+            if (cell && _current_cell_limit > 0) {
                 bytes column_name = composite::serialize_value(key.components(), _s.thrift().has_compound_comparator());
                 Aggregator::on_column(_current_aggregation, column_name, *cell);
-                _cell_limit -= 1;
+                _current_cell_limit -= 1;
             }
         }
         void accept_new_row(const query::result_row_view& static_row, const query::result_row_view& row) {
             auto it = row.iterator();
             for (auto&& id : _slice.regular_columns) {
                 auto cell = it.next_atomic_cell();
-                if (cell && _cell_limit > 0) {
+                if (cell && _current_cell_limit > 0) {
                     Aggregator::on_column(_current_aggregation, _s.regular_column_at(id).name(), *cell);
-                    _cell_limit -= 1;
+                    _current_cell_limit -= 1;
                 }
             }
         }
@@ -1526,6 +1578,13 @@ private:
         }
     };
     using column_aggregator = column_visitor<column_or_supercolumn_builder>;
+    struct counter_column_or_supercolumn_builder {
+        using type = std::vector<ColumnOrSuperColumn>;
+        void on_column(std::vector<ColumnOrSuperColumn>* current_cols, const bytes& name, const query::result_atomic_cell_view& cell) {
+            current_cols->emplace_back(make_counter_column_or_supercolumn(name, cell));
+        }
+    };
+    using counter_column_aggregator = column_visitor<counter_column_or_supercolumn_builder>;
     struct counter {
         using type = int32_t;
         void on_column(int32_t* current_cols, const bytes_view& name, const query::result_atomic_cell_view& cell) {
@@ -1533,7 +1592,7 @@ private:
         }
     };
     using column_counter = column_visitor<counter>;
-    static std::vector<query::partition_range> make_partition_range(const schema& s, const KeyRange& range) {
+    static dht::partition_range_vector make_partition_range(const schema& s, const KeyRange& range) {
         if (range.__isset.row_filter) {
             fail(unimplemented::cause::INDEXES);
         }
@@ -1564,8 +1623,8 @@ private:
                             "Start key's token sorts after end key's token. This is not allowed; you probably should not specify end key at all except with an ordered partitioner");
                 }
             }
-            return {{query::partition_range::bound(std::move(start), true),
-                     query::partition_range::bound(std::move(end), true)}};
+            return {{dht::partition_range::bound(std::move(start), true),
+                     dht::partition_range::bound(std::move(end), true)}};
         }
 
         if (range.__isset.start_key && range.__isset.end_token) {
@@ -1579,8 +1638,8 @@ private:
             } else if (end.less_compare(s, start)) {
                 throw make_exception<InvalidRequestException>("Start key's token sorts after end token");
             }
-            return {{query::partition_range::bound(std::move(start), true),
-                     query::partition_range::bound(std::move(end), true)}};
+            return {{dht::partition_range::bound(std::move(start), true),
+                     dht::partition_range::bound(std::move(end), true)}};
         }
 
         // Token range can wrap; the start token is exclusive.
@@ -1591,11 +1650,11 @@ private:
         }
         // Special case of start == end also generates wrap-around range
         if (start.token() >= end.token()) {
-            return {query::partition_range(query::partition_range::bound(std::move(start), false), {}),
-                    query::partition_range({}, query::partition_range::bound(std::move(end), true))};
+            return {dht::partition_range(dht::partition_range::bound(std::move(start), false), {}),
+                    dht::partition_range({}, dht::partition_range::bound(std::move(end), true))};
         }
-        return {{query::partition_range::bound(std::move(start), false),
-                 query::partition_range::bound(std::move(end), true)}};
+        return {{dht::partition_range::bound(std::move(start), false),
+                 dht::partition_range::bound(std::move(end), true)}};
     }
     static std::vector<KeySlice> to_key_slices(const schema& s, const query::partition_slice& slice, query::result_view v, uint32_t cell_limit) {
         column_aggregator aggregator(s, slice, cell_limit);
@@ -1701,6 +1760,28 @@ private:
         auto cell = atomic_cell::make_live(col.timestamp, to_bytes_view(col.value), maybe_ttl(s, col));
         m_to_apply.set_clustered_cell(std::move(ckey), def, std::move(cell));
     }
+    static void add_live_cell(const schema& s, const CounterColumn& col, const column_definition& def, clustering_key_prefix ckey, mutation& m_to_apply) {
+        //thrift_validation::validate_column(col, def);
+        auto cell = atomic_cell::make_live_counter_update(api::new_timestamp(), long_type->decompose(col.value));
+        m_to_apply.set_clustered_cell(std::move(ckey), def, std::move(cell));
+    }
+    static void add_to_mutation(const schema& s, const CounterColumn& col, mutation& m_to_apply) {
+        thrift_validation::validate_column_name(col.name);
+        if (s.thrift().is_dynamic()) {
+            auto&& value_col = s.regular_begin();
+            add_live_cell(s, col, *value_col, make_clustering_prefix(s, to_bytes_view(col.name)), m_to_apply);
+        } else {
+            auto def = s.get_column_definition(to_bytes(col.name));
+            if (def) {
+                if (def->kind != column_kind::regular_column) {
+                    throw make_exception<InvalidRequestException>("Column %s is not settable", col.name);
+                }
+                add_live_cell(s, col, *def, clustering_key_prefix::make_empty(s), m_to_apply);
+            } else {
+                fail(unimplemented::cause::MIXED_CF);
+            }
+        }
+    }
     static void add_to_mutation(const schema& s, const Column& col, mutation& m_to_apply) {
         thrift_validation::validate_column_name(col.name);
         if (s.thrift().is_dynamic()) {
@@ -1732,15 +1813,13 @@ private:
             } else if (cosc.__isset.super_column) {
                 fail(unimplemented::cause::SUPER);
             } else if (cosc.__isset.counter_column) {
-                fail(unimplemented::cause::COUNTERS);
+                add_to_mutation(s, cosc.counter_column, m_to_apply);
             } else if (cosc.__isset.counter_super_column) {
                 fail(unimplemented::cause::SUPER);
             }
         } else if (m.__isset.deletion) {
             auto&& del = m.deletion;
-            if (!del.__isset.timestamp) {
-                fail(unimplemented::cause::COUNTERS);
-            } else if (del.__isset.super_column) {
+            if (del.__isset.super_column) {
                 fail(unimplemented::cause::SUPER);
             } else if (del.__isset.predicate) {
                 apply_delete(s, del.predicate, del.timestamp, m_to_apply);
@@ -1769,6 +1848,9 @@ private:
         auto m_by_cf = group_by_cf(const_cast<mutation_map&>(m));
         for (auto&& cf_key : m_by_cf) {
             auto schema = lookup_schema(db, ks_name, cf_key.first);
+            if (schema->is_view()) {
+                throw make_exception<InvalidRequestException>("Cannot modify Materialized Views directly");
+            }
             schemas.emplace_back(schema);
             for (auto&& key_mutations : cf_key.second) {
                 mutation m_to_apply(key_from_thrift(*schema, to_bytes_view(key_mutations.first)), schema);

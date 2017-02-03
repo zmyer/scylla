@@ -82,7 +82,7 @@ private:
 public:
     void validate();
     std::map<sstring, sstring> get_compaction_options() const;
-    std::map<sstring, sstring> get_compression_options() const;
+    stdx::optional<std::map<sstring, sstring>> get_compression_options() const;
 #if 0
     public CachingOptions getCachingOptions() throws SyntaxException, ConfigurationException
     {
@@ -101,6 +101,7 @@ public:
     }
 #endif
     int32_t get_default_time_to_live() const;
+    int32_t get_gc_grace_seconds() const;
 
     void apply_to_builder(schema_builder& builder);
     void validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const;

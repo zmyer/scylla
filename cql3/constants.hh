@@ -44,6 +44,7 @@
 #include "cql3/abstract_marker.hh"
 #include "cql3/update_parameters.hh"
 #include "cql3/operation.hh"
+#include "cql3/values.hh"
 #include "cql3/term.hh"
 #include "core/shared_ptr.hh"
 
@@ -67,18 +68,20 @@ public:
     */
     class value : public terminal {
     public:
-        bytes_opt _bytes;
-        value(bytes_opt bytes_) : _bytes(std::move(bytes_)) {}
-        virtual bytes_opt get(const query_options& options) override { return _bytes; }
-        virtual bytes_view_opt bind_and_get(const query_options& options) override { return as_bytes_view_opt(_bytes); }
+        cql3::raw_value _bytes;
+        value(cql3::raw_value bytes_) : _bytes(std::move(bytes_)) {}
+        virtual cql3::raw_value get(const query_options& options) override { return _bytes; }
+        virtual cql3::raw_value_view bind_and_get(const query_options& options) override { return _bytes.to_view(); }
         virtual sstring to_string() const override { return to_hex(*_bytes); }
     };
+
+    static thread_local const ::shared_ptr<value> UNSET_VALUE;
 
     class null_literal final : public term::raw {
     private:
         class null_value final : public value {
         public:
-            null_value() : value({}) {}
+            null_value() : value(cql3::raw_value::make_null()) {}
             virtual ::shared_ptr<terminal> bind(const query_options& options) override { return {}; }
             virtual sstring to_string() const override { return "null"; }
         };
@@ -169,14 +172,13 @@ public:
             assert(!_receiver->type->is_collection());
         }
 
-        virtual bytes_view_opt bind_and_get(const query_options& options) override {
+        virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
             try {
                 auto value = options.get_value_at(_bind_index);
                 if (value) {
                     _receiver->type->validate(*value);
-                    return *value;
                 }
-                return std::experimental::nullopt;
+                return value;
             } catch (const marshal_exception& e) {
                 throw exceptions::invalid_request_exception(e.what());
             }
@@ -187,7 +189,7 @@ public:
             if (!bytes) {
                 return ::shared_ptr<terminal>{};
             }
-            return ::make_shared<constants::value>(std::move(to_bytes_opt(*bytes)));
+            return ::make_shared<constants::value>(std::move(cql3::raw_value::make_value(to_bytes(*bytes))));
         }
     };
 
@@ -197,52 +199,46 @@ public:
 
         virtual void execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) override {
             auto value = _t->bind_and_get(params._options);
-            auto cell = value ? make_cell(*value, params) : make_dead_cell(params);
-            m.set_cell(prefix, column, std::move(cell));
+            if (value.is_null()) {
+                m.set_cell(prefix, column, std::move(make_dead_cell(params)));
+            } else if (value.is_value()) {
+                m.set_cell(prefix, column, std::move(make_cell(*value, params)));
+            }
         }
     };
 
-#if 0
-    public static class Adder extends Operation
-    {
-        public Adder(ColumnDefinition column, Term t)
-        {
-            super(column, t);
+    struct adder final : operation {
+        using operation::operation;
+
+        virtual void execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) override {
+            auto value = _t->bind_and_get(params._options);
+            if (value.is_null()) {
+                throw exceptions::invalid_request_exception("Invalid null value for counter increment");
+            } else if (value.is_unset_value()) {
+                return;
+            }
+            auto increment = value_cast<int64_t>(long_type->deserialize_value(*value));
+            m.set_cell(prefix, column, make_counter_update_cell(increment, params));
         }
+    };
 
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
-        {
-            ByteBuffer bytes = t.bindAndGet(params.options);
-            if (bytes == null)
-                throw new InvalidRequestException("Invalid null value for counter increment");
-            long increment = ByteBufferUtil.toLong(bytes);
-            CellName cname = cf.getComparator().create(prefix, column);
-            cf.addColumn(params.makeCounter(cname, increment));
+    struct subtracter final : operation {
+        using operation::operation;
+
+        virtual void execute(mutation& m, const exploded_clustering_prefix& prefix, const update_parameters& params) override {
+            auto value = _t->bind_and_get(params._options);
+            if (value.is_null()) {
+                throw exceptions::invalid_request_exception("Invalid null value for counter increment");
+            } else if (value.is_unset_value()) {
+                return;
+            }
+            auto increment = value_cast<int64_t>(long_type->deserialize_value(*value));
+            if (increment == std::numeric_limits<int64_t>::min()) {
+                throw exceptions::invalid_request_exception(sprint("The negation of %d overflows supported counter precision (signed 8 bytes integer)", increment));
+            }
+            m.set_cell(prefix, column, make_counter_update_cell(-increment, params));
         }
-    }
-
-    public static class Substracter extends Operation
-    {
-        public Substracter(ColumnDefinition column, Term t)
-        {
-            super(column, t);
-        }
-
-        public void execute(ByteBuffer rowKey, ColumnFamily cf, Composite prefix, UpdateParameters params) throws InvalidRequestException
-        {
-            ByteBuffer bytes = t.bindAndGet(params.options);
-            if (bytes == null)
-                throw new InvalidRequestException("Invalid null value for counter increment");
-
-            long increment = ByteBufferUtil.toLong(bytes);
-            if (increment == Long.MIN_VALUE)
-                throw new InvalidRequestException("The negation of " + increment + " overflows supported counter precision (signed 8 bytes integer)");
-
-            CellName cname = cf.getComparator().create(prefix, column);
-            cf.addColumn(params.makeCounter(cname, -increment));
-        }
-    }
-#endif
+    };
 
     class deleter : public operation {
     public:

@@ -58,13 +58,13 @@ public:
     template<typename Hasher>
     void feed_hash(Hasher& h, const column_definition& def) const {
         if (def.is_atomic()) {
-            ::feed_hash(h, as_atomic_cell());
+            ::feed_hash(h, as_atomic_cell(), def);
         } else {
-            ::feed_hash(as_collection_mutation(), h, def.type);
+            ::feed_hash(h, as_collection_mutation(), def);
         }
     }
-    size_t memory_usage() const {
-        return _data.memory_usage();
+    size_t external_memory_usage() const {
+        return _data.external_memory_usage();
     }
     friend std::ostream& operator<<(std::ostream&, const atomic_cell_or_collection&);
 };

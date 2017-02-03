@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include <iostream>
+#include <iosfwd>
 
 #include "mutation_partition.hh"
 #include "keys.hh"
@@ -131,6 +131,10 @@ public:
 
     void apply(mutation&&);
     void apply(const mutation&);
+
+    mutation operator+(const mutation& other) const;
+    mutation& operator+=(const mutation& other);
+    mutation& operator+=(mutation&& other);
 private:
     friend std::ostream& operator<<(std::ostream& os, const mutation& m);
 };
@@ -179,7 +183,7 @@ void apply(mutation_opt& dst, mutation_opt&& src) {
 // range must not wrap around.
 boost::iterator_range<std::vector<mutation>::const_iterator> slice(
     const std::vector<mutation>& partitions,
-    const query::partition_range&);
+    const dht::partition_range&);
 
 future<mutation_opt> mutation_from_streamed_mutation(streamed_mutation_opt sm);
 future<mutation_opt>

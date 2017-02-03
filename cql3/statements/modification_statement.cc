@@ -50,6 +50,7 @@
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/algorithm_ext/push_back.hpp>
 #include <boost/range/adaptor/filtered.hpp>
+#include "service/storage_service.hh"
 
 namespace cql3 {
 
@@ -73,12 +74,13 @@ operator<<(std::ostream& out, modification_statement::statement_type t) {
     return out;
 }
 
-modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_)
+modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, uint64_t* cql_stats_counter_ptr)
     : type{type_}
     , _bound_terms{bound_terms}
     , s{schema_}
     , attrs{std::move(attrs_)}
     , _column_operations{}
+    , _cql_modification_counter_ptr(cql_stats_counter_ptr)
 { }
 
 bool modification_statement::uses_function(const sstring& ks_name, const sstring& function_name) const {
@@ -125,6 +127,10 @@ bool modification_statement::is_counter() const {
     return s->is_counter();
 }
 
+bool modification_statement::is_view() const {
+    return s->is_view();
+}
+
 int64_t modification_statement::get_timestamp(int64_t now, const query_options& options) const {
     return attrs->get_timestamp(now, options);
 }
@@ -142,6 +148,19 @@ future<> modification_statement::check_access(const service::client_state& state
     if (has_conditions()) {
         f = f.then([this, &state] {
            return state.has_column_family_access(keyspace(), column_family(), auth::permission::SELECT);
+        });
+    }
+    // MV updates need to get the current state from the table, and might update the views
+    // Require Permission.SELECT on the base table, and Permission.MODIFY on the views
+    auto& db = service::get_local_storage_service().db().local();
+    auto&& views = db.find_column_family(keyspace(), column_family()).views();
+    if (!views.empty()) {
+        f = f.then([this, &state] {
+            return state.has_column_family_access(keyspace(), column_family(), auth::permission::SELECT);
+        }).then([this, &state, views = std::move(views)] {
+            return parallel_for_each(views, [this, &state] (auto&& view) {
+                return state.has_column_family_access(this->keyspace(), view->cf_name(), auth::permission::MODIFY);
+            });
         });
     }
     return f;
@@ -287,7 +306,7 @@ modification_statement::read_required_rows(
                 query::partition_slice::option::send_partition_key,
                 query::partition_slice::option::send_clustering_key,
                 query::partition_slice::option::collections_as_maps>());
-    std::vector<query::partition_range> pr;
+    dht::partition_range_vector pr;
     for (auto&& pk : *keys) {
         pr.emplace_back(dht::global_partitioner().decorate_key(*s, pk));
     }
@@ -453,6 +472,8 @@ modification_statement::execute(distributed<service::storage_proxy>& proxy, serv
         return execute_with_condition(proxy, qs, options);
     }
 
+    inc_cql_stats();
+
     return execute_without_condition(proxy, qs, options).then([] {
         return make_ready_future<::shared_ptr<transport::messages::result_message>>(
                 ::shared_ptr<transport::messages::result_message>{});
@@ -468,7 +489,7 @@ modification_statement::execute_without_condition(distributed<service::storage_p
         db::validate_for_write(s->ks_name(), cl);
     }
 
-    return get_mutations(proxy, options, false, options.get_timestamp(qs), qs.get_trace_state()).then([cl, &proxy, &qs] (auto mutations) {
+    return get_mutations(proxy, options, false, options.get_timestamp(qs), qs.get_trace_state()).then([this, cl, &proxy, &qs] (auto mutations) {
         if (mutations.empty()) {
             return now();
         }
@@ -513,6 +534,8 @@ modification_statement::execute_internal(distributed<service::storage_proxy>& pr
 
     tracing::add_table_name(qs.get_trace_state(), keyspace(), column_family());
 
+    inc_cql_stats();
+
     return get_mutations(proxy, options, true, options.get_timestamp(qs), qs.get_trace_state()).then(
             [&proxy] (auto mutations) {
                 return proxy.local().mutate_locally(std::move(mutations));
@@ -555,7 +578,7 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
         auto id = rel->get_entity()->prepare_column_identifier(s);
         auto def = get_column_definition(s, *id);
         if (!def) {
-            throw exceptions::invalid_request_exception(sprint("Unknown key identifier %s", *id));
+            throw exceptions::invalid_request_exception(sprint("Unknown key identifier %s on  table %s", *id, s->cf_name()));
         }
 
         if (def->is_primary_key()) {
@@ -573,20 +596,20 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
 namespace raw {
 
 ::shared_ptr<prepared_statement>
-modification_statement::modification_statement::prepare(database& db) {
+modification_statement::modification_statement::prepare(database& db, cql_stats& stats) {
     auto bound_names = get_bound_variables();
-    auto statement = prepare(db, bound_names);
+    auto statement = prepare(db, bound_names, stats);
     return ::make_shared<prepared>(std::move(statement), *bound_names);
 }
 
 ::shared_ptr<cql3::statements::modification_statement>
-modification_statement::prepare(database& db, ::shared_ptr<variable_specifications> bound_names) {
+modification_statement::prepare(database& db, ::shared_ptr<variable_specifications> bound_names, cql_stats& stats) {
     schema_ptr schema = validation::validate_column_family(db, keyspace(), column_family());
 
     auto prepared_attributes = _attrs->prepare(db, keyspace(), column_family());
     prepared_attributes->collect_marker_specification(bound_names);
 
-    ::shared_ptr<cql3::statements::modification_statement> stmt = prepare_internal(db, schema, bound_names, std::move(prepared_attributes));
+    ::shared_ptr<cql3::statements::modification_statement> stmt = prepare_internal(db, schema, bound_names, std::move(prepared_attributes), stats);
 
     if (_if_not_exists || _if_exists || !_conditions.empty()) {
         if (stmt->is_counter()) {
@@ -642,6 +665,10 @@ modification_statement::validate(distributed<service::storage_proxy>&, const ser
 
     if (is_counter() && attrs->is_time_to_live_set()) {
         throw exceptions::invalid_request_exception("Cannot provide custom TTL for counter updates");
+    }
+
+    if (is_view()) {
+        throw exceptions::invalid_request_exception("Cannot directly modify a materialized view");
     }
 }
 

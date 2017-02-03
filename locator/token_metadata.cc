@@ -25,6 +25,8 @@
 #include "locator/snitch_base.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "log.hh"
+#include "stdx.hh"
+#include "partition_range_compat.hh"
 #include <unordered_map>
 #include <algorithm>
 #include <boost/icl/interval.hpp>
@@ -241,7 +243,7 @@ void token_metadata::add_bootstrap_token(token t, inet_address endpoint) {
 
 boost::iterator_range<token_metadata::tokens_iterator>
 token_metadata::ring_range(
-    const std::experimental::optional<query::partition_range::bound>& start,
+    const std::experimental::optional<dht::partition_range::bound>& start,
     bool include_min) const
 {
     auto r = ring_range(start ? start->value().token() : dht::minimum_token(), include_min);
@@ -327,18 +329,21 @@ token token_metadata::get_predecessor(token t) {
     }
 }
 
-std::vector<range<token>> token_metadata::get_primary_ranges_for(std::unordered_set<token> tokens) {
-    std::vector<range<token>> ranges;
-    ranges.reserve(tokens.size());
+dht::token_range_vector token_metadata::get_primary_ranges_for(std::unordered_set<token> tokens) {
+    dht::token_range_vector ranges;
+    ranges.reserve(tokens.size() + 1); // one of the ranges will wrap
     for (auto right : tokens) {
-        ranges.emplace_back(range<token>::bound(get_predecessor(right), false),
-                            range<token>::bound(right, true));
+        auto left = get_predecessor(right);
+        compat::unwrap_into(
+                wrapping_range<token>(range_bound<token>(left, false), range_bound<token>(right)),
+                dht::token_comparator(),
+                [&] (auto&& rng) { ranges.push_back(std::move(rng)); });
     }
     return ranges;
 }
 
-range<token> token_metadata::get_primary_range_for(token right) {
-    return get_primary_ranges_for({right}).front();
+dht::token_range_vector token_metadata::get_primary_ranges_for(token right) {
+    return get_primary_ranges_for(std::unordered_set<token>{right});
 }
 
 boost::icl::interval<token>::interval_type
@@ -367,6 +372,29 @@ token_metadata::range_to_interval(range<dht::token> r) {
     } else {
         return boost::icl::interval<token>::closed(std::move(start), std::move(end));
     }
+}
+
+range<dht::token>
+token_metadata::interval_to_range(boost::icl::interval<token>::interval_type i) {
+    bool start_inclusive;
+    bool end_inclusive;
+    auto bounds = i.bounds().bits();
+    if (bounds == boost::icl::interval_bounds::static_open) {
+        start_inclusive = false;
+        end_inclusive = false;
+    } else if (bounds == boost::icl::interval_bounds::static_left_open) {
+        start_inclusive = false;
+        end_inclusive = true;
+    } else if (bounds == boost::icl::interval_bounds::static_right_open) {
+        start_inclusive = true;
+        end_inclusive = false;
+    } else if (bounds == boost::icl::interval_bounds::static_closed) {
+        start_inclusive = true;
+        end_inclusive = true;
+    } else {
+        throw std::runtime_error("Invalid boost::icl::interval<token> bounds");
+    }
+    return range<dht::token>({{i.lower(), start_inclusive}}, {{i.upper(), end_inclusive}});
 }
 
 void token_metadata::set_pending_ranges(const sstring& keyspace_name,
@@ -424,7 +452,7 @@ void token_metadata::calculate_pending_ranges(abstract_replication_strategy& str
         return;
     }
 
-    std::unordered_multimap<inet_address, range<token>> address_ranges = strategy.get_address_ranges(*this);
+    std::unordered_multimap<inet_address, dht::token_range> address_ranges = strategy.get_address_ranges(*this);
 
     // FIMXE
     // Copy of metadata reflecting the situation after all leave operations are finished.

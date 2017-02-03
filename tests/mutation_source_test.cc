@@ -22,6 +22,7 @@
 #include "schema_builder.hh"
 #include "mutation_reader_assertions.hh"
 #include "mutation_source_test.hh"
+#include "counters.hh"
 
 // partitions must be sorted by decorated key
 static void require_no_token_duplicates(const std::vector<mutation>& partitions) {
@@ -68,7 +69,7 @@ static void test_range_queries(populate_fn populate) {
 
     auto ds = populate(s, partitions);
 
-    auto test_slice = [&] (query::range<dht::ring_position> r) {
+    auto test_slice = [&] (dht::partition_range r) {
         BOOST_TEST_MESSAGE(sprint("Testing range %s", r));
         assert_that(ds(s, r))
             .produces(slice(partitions, r))
@@ -76,73 +77,73 @@ static void test_range_queries(populate_fn populate) {
     };
 
     auto inclusive_token_range = [&] (size_t start, size_t end) {
-        return query::partition_range::make(
+        return dht::partition_range::make(
             {dht::ring_position::starting_at(partitions[start].token())},
             {dht::ring_position::ending_at(partitions[end].token())});
     };
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {key_before_all, true}, {partitions.front().decorated_key(), true}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {key_before_all, false}, {partitions.front().decorated_key(), true}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {key_before_all, false}, {partitions.front().decorated_key(), false}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::starting_at(key_before_all.token())},
         {dht::ring_position::ending_at(partitions.front().token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::ending_at(key_before_all.token())},
         {dht::ring_position::ending_at(partitions.front().token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::ending_at(key_before_all.token())},
         {dht::ring_position::starting_at(partitions.front().token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions.back().decorated_key(), true}, {key_after_all, true}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions.back().decorated_key(), true}, {key_after_all, false}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions.back().decorated_key(), false}, {key_after_all, false}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::starting_at(partitions.back().token())},
         {dht::ring_position::ending_at(key_after_all.token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::starting_at(partitions.back().token())},
         {dht::ring_position::starting_at(key_after_all.token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {dht::ring_position::ending_at(partitions.back().token())},
         {dht::ring_position::starting_at(key_after_all.token())}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions[0].decorated_key(), false},
         {partitions[1].decorated_key(), true}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions[0].decorated_key(), true},
         {partitions[1].decorated_key(), false}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions[1].decorated_key(), true},
         {partitions[3].decorated_key(), false}));
 
-    test_slice(query::partition_range::make(
+    test_slice(dht::partition_range::make(
         {partitions[1].decorated_key(), false},
         {partitions[3].decorated_key(), true}));
 
-    test_slice(query::partition_range::make_ending_with(
+    test_slice(dht::partition_range::make_ending_with(
         {partitions[3].decorated_key(), true}));
 
-    test_slice(query::partition_range::make_starting_with(
+    test_slice(dht::partition_range::make_starting_with(
         {partitions[partitions.size() - 4].decorated_key(), true}));
 
     test_slice(inclusive_token_range(0, 0));
@@ -190,6 +191,7 @@ static mutation_sets generate_mutation_sets() {
                 .with_column("ck_col_2", bytes_type, column_kind::clustering_key)
                 .with_column("regular_col_1", bytes_type)
                 .with_column("regular_col_2", bytes_type)
+                .with_column("regular_counter_col_1", counter_type)
                 .with_column("static_col_1", bytes_type, column_kind::static_column)
                 .with_column("static_col_2", bytes_type, column_kind::static_column);
 
@@ -301,7 +303,7 @@ static mutation_sets generate_mutation_sets() {
     {
         random_mutation_generator gen;
         for (int i = 0; i < 10; ++i) {
-            auto m = gen(false);
+            auto m = gen();
             result.unequal.emplace_back(mutations{m, gen()}); // collision unlikely
             result.equal.emplace_back(mutations{m, m});
         }
@@ -378,7 +380,8 @@ public:
         auto builder = schema_builder("ks", "cf")
                 .with_column("pk", bytes_type, column_kind::partition_key)
                 .with_column("ck1", bytes_type, column_kind::clustering_key)
-                .with_column("ck2", bytes_type, column_kind::clustering_key);
+                .with_column("ck2", bytes_type, column_kind::clustering_key)
+                .with_column("c1", counter_type);
 
         // Create enough columns so that row can overflow its vector storage
         for (column_id i = 0; i < column_count; ++i) {
@@ -409,7 +412,7 @@ public:
         _gen = std::mt19937(seed);
     }
 
-    mutation operator()(bool range_deletes) {
+    mutation operator()() {
         std::uniform_int_distribution<column_id> column_count_dist(1, column_count);
         std::uniform_int_distribution<column_id> column_id_dist(0, column_count - 1);
         std::uniform_int_distribution<size_t> value_blob_index_dist(0, 2);
@@ -421,14 +424,53 @@ public:
         auto pkey = partition_key::from_single_value(*_schema, _blobs[0]);
         mutation m(pkey, _schema);
 
+        auto& counter_column = *_schema->get_column_definition(utf8_type->decompose(sstring("c1")));
+
+        std::map<counter_id, std::set<int64_t>> counter_used_clock_values;
+        std::vector<counter_id> counter_ids;
+        std::generate_n(std::back_inserter(counter_ids), 8, counter_id::generate_random);
+
+        auto random_counter_cell = [&] {
+            std::uniform_int_distribution<size_t> shard_count_dist(1, counter_ids.size());
+            std::uniform_int_distribution<int64_t> value_dist(-100, 100);
+            std::uniform_int_distribution<int64_t> clock_dist(0, 20000);
+
+            auto shard_count = shard_count_dist(_gen);
+            std::set<counter_id> shards;
+            for (auto i = 0u; i < shard_count; i++) {
+                shards.emplace(counter_ids[shard_count_dist(_gen) - 1]);
+            }
+
+            counter_cell_builder ccb;
+            for (auto&& id : shards) {
+                // Make sure we don't get shards with the same id and clock
+                // but different value.
+                int64_t clock = clock_dist(_gen);
+                while (counter_used_clock_values[id].count(clock)) {
+                    clock = clock_dist(_gen);
+                }
+                counter_used_clock_values[id].emplace(clock);
+                ccb.add_shard(counter_shard(id, value_dist(_gen), clock));
+            }
+            return ccb.build(timestamp_dist(_gen));
+        };
+
         auto set_random_cells = [&] (row& r, column_kind kind) {
             auto columns_to_set = column_count_dist(_gen);
             for (column_id i = 0; i < columns_to_set; ++i) {
+                auto cid = column_id_dist(_gen);
+                if (kind == column_kind::regular_column && cid == counter_column.id) {
+                    auto cell = bool_dist(_gen)
+                                ? random_counter_cell()
+                                : atomic_cell::make_dead(timestamp_dist(_gen), expiry_dist(_gen));
+                    r.apply(_schema->column_at(kind, cid), std::move(cell));
+                    continue;
+                }
                 // FIXME: generate expiring cells
                 auto cell = bool_dist(_gen)
                             ? atomic_cell::make_live(timestamp_dist(_gen), _blobs[value_blob_index_dist(_gen)])
                             : atomic_cell::make_dead(timestamp_dist(_gen), expiry_dist(_gen));
-                r.apply(_schema->column_at(kind, column_id_dist(_gen)), std::move(cell));
+                r.apply(_schema->column_at(kind, cid), std::move(cell));
             }
         };
 
@@ -465,7 +507,7 @@ public:
         size_t row_count = row_count_dist(_gen);
         for (size_t i = 0; i < row_count; ++i) {
             auto ckey = clustering_key::from_exploded(*_schema, {random_blob(), random_blob()});
-            deletable_row& row = m.partition().clustered_row(ckey);
+            deletable_row& row = m.partition().clustered_row(*_schema, ckey);
             set_random_cells(row.cells(), column_kind::regular_column);
             row.marker() = random_row_marker();
         }
@@ -473,17 +515,13 @@ public:
         size_t range_tombstone_count = row_count_dist(_gen);
         for (size_t i = 0; i < range_tombstone_count; ++i) {
             auto&& start = clustering_key::from_exploded(*_schema, {random_blob()});
-            if (range_deletes) {
-                clustering_key_prefix::less_compare less(*_schema);
-                auto end = clustering_key::from_exploded(*_schema, {random_blob()});
-                if (less(end, start)) {
-                    std::swap(start, end);
-                }
-                m.partition().apply_row_tombstone(*_schema,
-                        range_tombstone(std::move(start), std::move(end), random_tombstone()));
-            } else {
-                m.partition().apply_row_tombstone(*_schema, start, random_tombstone());
+            clustering_key_prefix::less_compare less(*_schema);
+            auto end = clustering_key::from_exploded(*_schema, {random_blob()});
+            if (less(end, start)) {
+                std::swap(start, end);
             }
+            m.partition().apply_row_tombstone(*_schema,
+                    range_tombstone(std::move(start), std::move(end), random_tombstone()));
         }
         return m;
     }
@@ -495,8 +533,8 @@ random_mutation_generator::random_mutation_generator()
     : _impl(std::make_unique<random_mutation_generator::impl>())
 { }
 
-mutation random_mutation_generator::operator()(bool range_deletes) {
-    return (*_impl)(range_deletes);
+mutation random_mutation_generator::operator()() {
+    return (*_impl)();
 }
 
 schema_ptr random_mutation_generator::schema() const {

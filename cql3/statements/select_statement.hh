@@ -89,6 +89,7 @@ private:
     ordering_comparator_type _ordering_comparator;
 
     query::partition_slice::option_set _opts;
+    cql_stats& _stats;
 public:
     select_statement(schema_ptr schema,
             uint32_t bound_terms,
@@ -97,7 +98,8 @@ public:
             ::shared_ptr<restrictions::statement_restrictions> restrictions,
             bool is_reversed,
             ordering_comparator_type ordering_comparator,
-            ::shared_ptr<term> limit);
+            ::shared_ptr<term> limit,
+            cql_stats& stats);
 
     virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
 
@@ -105,7 +107,7 @@ public:
     // Note that the results select statement should not be used for actual queries, but only for processing already
     // queried data through processColumnFamily.
     static ::shared_ptr<select_statement> for_selection(
-        schema_ptr schema, ::shared_ptr<selection::selection> selection);
+        schema_ptr schema, ::shared_ptr<selection::selection> selection, cql_stats& stats);
 
     virtual ::shared_ptr<const cql3::metadata> get_result_metadata() const override;
     virtual uint32_t get_bound_terms() override;
@@ -121,11 +123,11 @@ public:
             service::query_state& state, const query_options& options) override;
 
     future<::shared_ptr<transport::messages::result_message>> execute(distributed<service::storage_proxy>& proxy,
-        lw_shared_ptr<query::read_command> cmd, std::vector<query::partition_range>&& partition_ranges, service::query_state& state,
-         const query_options& options, db_clock::time_point now);
+        lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
+         const query_options& options, gc_clock::time_point now);
 
     shared_ptr<transport::messages::result_message> process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
-        lw_shared_ptr<query::read_command> cmd, const query_options& options, db_clock::time_point now);
+        lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now);
 #if 0
     private ResultMessage.Rows pageAggregateQuery(QueryPager pager, QueryOptions options, int pageSize, long now)
             throws RequestValidationException, RequestExecutionException
@@ -180,6 +182,8 @@ public:
     const sstring& column_family() const;
 
     query::partition_slice make_partition_slice(const query_options& options);
+
+    ::shared_ptr<restrictions::statement_restrictions> get_restrictions() const;
 
 #if 0
     private SliceQueryFilter sliceFilter(ColumnSlice slice, int limit, int toGroup)

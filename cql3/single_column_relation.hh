@@ -110,6 +110,11 @@ public:
     ::shared_ptr<term::raw> get_map_key() {
         return _map_key;
     }
+
+    ::shared_ptr<term::raw> get_value() {
+        return _value;
+    }
+
 protected:
     virtual ::shared_ptr<term> to_term(const std::vector<::shared_ptr<column_specification>>& receivers,
                           ::shared_ptr<term::raw> raw, database& db, const sstring& keyspace,
@@ -162,6 +167,13 @@ protected:
         auto&& column_def = to_column_definition(schema, _entity);
         auto term = to_term(to_receivers(schema, column_def), _value, db, schema->ks_name(), std::move(bound_names));
         return ::make_shared<restrictions::single_column_restriction::contains>(column_def, std::move(term), is_key);
+    }
+
+    virtual ::shared_ptr<relation> maybe_rename_identifier(const column_identifier::raw& from, column_identifier::raw to) override {
+        return *_entity == from
+            ? ::make_shared(single_column_relation(
+                  ::make_shared<column_identifier::raw>(std::move(to)), _map_key, _relation_type, _value, _in_values))
+            : static_pointer_cast<single_column_relation>(shared_from_this());
     }
 
 private:

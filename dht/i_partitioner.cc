@@ -24,7 +24,10 @@
 #include "murmur3_partitioner.hh"
 #include "utils/class_registrator.hh"
 #include "types.hh"
+#include "utils/murmur_hash.hh"
 #include <boost/range/adaptor/map.hpp>
+#include <boost/range/irange.hpp>
+#include <boost/range/adaptor/transformed.hpp>
 
 namespace dht {
 
@@ -112,21 +115,6 @@ static inline unsigned char get_byte(bytes_view b, size_t off) {
     }
 }
 
-int i_partitioner::tri_compare(const token& t1, const token& t2) {
-    size_t sz = std::max(t1._data.size(), t2._data.size());
-
-    for (size_t i = 0; i < sz; i++) {
-        auto b1 = get_byte(t1._data, i);
-        auto b2 = get_byte(t2._data, i);
-        if (b1 < b2) {
-            return -1;
-        } else if (b1 > b2) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 int tri_compare(const token& t1, const token& t2) {
     if (t1._kind == t2._kind) {
         return global_partitioner().tri_compare(t1, t2);
@@ -174,10 +162,10 @@ std::ostream& operator<<(std::ostream& out, const decorated_key& dk) {
 // FIXME: make it per-keyspace
 std::unique_ptr<i_partitioner> default_partitioner { new murmur3_partitioner };
 
-void set_global_partitioner(const sstring& class_name)
+void set_global_partitioner(const sstring& class_name, unsigned ignore_msb)
 {
     try {
-        default_partitioner = create_object<i_partitioner>(class_name);
+        default_partitioner = create_object<i_partitioner, const unsigned&, const unsigned&>(class_name, smp::count, ignore_msb);
     } catch (std::exception& e) {
         auto supported_partitioners = ::join(", ", class_registry<i_partitioner>::classes() |
                 boost::adaptors::map_keys);
@@ -263,6 +251,51 @@ unsigned shard_of(const token& t) {
     return global_partitioner().shard_of(t);
 }
 
+stdx::optional<ring_position_range_and_shard>
+ring_position_range_sharder::next(const schema& s) {
+    if (_done) {
+        return {};
+    }
+    auto shard = _range.start() ? shard_of(_range.start()->value().token()) : global_partitioner().shard_of_minimum_token();
+    auto shard_boundary_token = _partitioner.token_for_next_shard(_range.start() ? _range.start()->value().token() : minimum_token());
+    auto shard_boundary = ring_position::starting_at(shard_boundary_token);
+    if ((!_range.end() || shard_boundary.less_compare(s, _range.end()->value()))
+            && shard_boundary_token != maximum_token()) {
+        // split the range at end_of_shard
+        auto start = _range.start();
+        auto end = range_bound<ring_position>(shard_boundary, false);
+        _range = dht::partition_range(
+                range_bound<ring_position>(std::move(shard_boundary), true),
+                std::move(_range.end()));
+        return ring_position_range_and_shard{dht::partition_range(std::move(start), std::move(end)), shard};
+    }
+    _done = true;
+    return ring_position_range_and_shard{std::move(_range), shard};
+}
+
+ring_position_range_vector_sharder::ring_position_range_vector_sharder(dht::partition_range_vector ranges)
+        : _ranges(std::move(ranges))
+        , _current_range(_ranges.begin()) {
+    next_range();
+}
+
+stdx::optional<ring_position_range_and_shard_and_element>
+ring_position_range_vector_sharder::next(const schema& s) {
+    if (!_current_sharder) {
+        return stdx::nullopt;
+    }
+    auto range_and_shard = _current_sharder->next(s);
+    while (!range_and_shard && _current_range != _ranges.end()) {
+        next_range();
+        range_and_shard = _current_sharder->next(s);
+    }
+    auto ret = stdx::optional<ring_position_range_and_shard_and_element>();
+    if (range_and_shard) {
+        ret.emplace(std::move(*range_and_shard), _current_range - _ranges.begin() - 1);
+    }
+    return ret;
+}
+
 int ring_position_comparator::operator()(const ring_position& lh, const ring_position& rh) const {
     return lh.tri_compare(s, rh);
 }
@@ -297,9 +330,9 @@ int ring_position::tri_compare(const schema& s, const ring_position& o) const {
     }
 }
 
-range<ring_position>
-to_partition_range(range<dht::token> r) {
-    using bound_opt = std::experimental::optional<range<ring_position>::bound>;
+dht::partition_range
+to_partition_range(dht::token_range r) {
+    using bound_opt = std::experimental::optional<dht::partition_range::bound>;
     auto start = r.start()
                  ? bound_opt(dht::ring_position(r.start()->value(),
                                                 r.start()->is_inclusive()
@@ -315,6 +348,46 @@ to_partition_range(range<dht::token> r) {
                : bound_opt();
 
     return { std::move(start), std::move(end) };
+}
+
+std::map<unsigned, dht::partition_range_vector>
+split_range_to_shards(dht::partition_range pr, const schema& s) {
+    std::map<unsigned, dht::partition_range_vector> ret;
+    auto sharder = dht::ring_position_range_sharder(std::move(pr));
+    auto rprs = sharder.next(s);
+    while (rprs) {
+        ret[rprs->shard].emplace_back(rprs->ring_range);
+        rprs = sharder.next(s);
+    }
+    return ret;
+}
+
+std::map<unsigned, dht::partition_range_vector>
+split_ranges_to_shards(const dht::token_range_vector& ranges, const schema& s) {
+    std::map<unsigned, dht::partition_range_vector> ret;
+    for (const auto& range : ranges) {
+        auto pr = dht::to_partition_range(range);
+        auto sharder = dht::ring_position_range_sharder(std::move(pr));
+        auto rprs = sharder.next(s);
+        while (rprs) {
+            ret[rprs->shard].emplace_back(rprs->ring_range);
+            rprs = sharder.next(s);
+        }
+    }
+    return ret;
+}
+
+}
+
+namespace std {
+
+size_t
+hash<dht::token>::hash_large_token(const managed_bytes& b) const {
+    auto read_bytes = boost::irange<size_t>(0, b.size())
+            | boost::adaptors::transformed([&b] (size_t idx) { return b[idx]; });
+    std::array<uint64_t, 2> result;
+    utils::murmur_hash::hash3_x64_128(read_bytes.begin(), b.size(), 0, result);
+    return result[0];
 }
 
 }

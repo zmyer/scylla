@@ -44,6 +44,7 @@
 
 #include "transport/messages/result_message.hh"
 #include "cql3/selection/selection.hh"
+#include "cql3/util.hh"
 #include "core/shared_ptr.hh"
 #include "query-result-reader.hh"
 #include "query_result_merger.hh"
@@ -87,7 +88,8 @@ select_statement::select_statement(schema_ptr schema,
                                    ::shared_ptr<restrictions::statement_restrictions> restrictions,
                                    bool is_reversed,
                                    ordering_comparator_type ordering_comparator,
-                                   ::shared_ptr<term> limit)
+                                   ::shared_ptr<term> limit,
+                                   cql_stats& stats)
     : _schema(schema)
     , _bound_terms(bound_terms)
     , _parameters(std::move(parameters))
@@ -96,6 +98,7 @@ select_statement::select_statement(schema_ptr schema,
     , _is_reversed(is_reversed)
     , _limit(std::move(limit))
     , _ordering_comparator(std::move(ordering_comparator))
+    , _stats(stats)
 {
     _opts = _selection->get_query_options();
 }
@@ -107,7 +110,7 @@ bool select_statement::uses_function(const sstring& ks_name, const sstring& func
 }
 
 ::shared_ptr<select_statement>
-select_statement::for_selection(schema_ptr schema, ::shared_ptr<selection::selection> selection) {
+select_statement::for_selection(schema_ptr schema, ::shared_ptr<selection::selection> selection, cql_stats& stats) {
     return ::make_shared<select_statement>(schema,
         0,
         _default_parameters,
@@ -115,7 +118,8 @@ select_statement::for_selection(schema_ptr schema, ::shared_ptr<selection::selec
         ::make_shared<restrictions::statement_restrictions>(schema),
         false,
         ordering_comparator_type{},
-        ::shared_ptr<term>{});
+        ::shared_ptr<term>{},
+        stats);
 }
 
 ::shared_ptr<const cql3::metadata> select_statement::get_result_metadata() const {
@@ -128,7 +132,14 @@ uint32_t select_statement::get_bound_terms() {
 }
 
 future<> select_statement::check_access(const service::client_state& state) {
-    return state.has_column_family_access(keyspace(), column_family(), auth::permission::SELECT);
+    try {
+        auto&& s = service::get_local_storage_proxy().get_db().local().find_schema(keyspace(), column_family());
+        auto& cf_name = s->is_view() ? s->view_info()->base_name() : column_family();
+        return state.has_column_family_access(keyspace(), cf_name, auth::permission::SELECT);
+    } catch (const no_such_column_family& e) {
+        // Will be validated afterwards.
+        return make_ready_future<>();
+    }
 }
 
 void select_statement::validate(distributed<service::storage_proxy>&, const service::client_state& state) {
@@ -192,10 +203,12 @@ int32_t select_statement::get_limit(const query_options& options) const {
     }
 
     auto val = _limit->bind_and_get(options);
-    if (!val) {
+    if (val.is_null()) {
         throw exceptions::invalid_request_exception("Invalid null value of limit");
     }
-
+    if (val.is_unset_value()) {
+        return std::numeric_limits<int32_t>::max();
+    }
     try {
         int32_type->validate(*val);
         auto l = value_cast<int32_t>(int32_type->deserialize(*val));
@@ -225,10 +238,12 @@ select_statement::execute(distributed<service::storage_proxy>& proxy,
     validate_for_read(_schema->ks_name(), cl);
 
     int32_t limit = get_limit(options);
-    auto now = db_clock::now();
+    auto now = gc_clock::now();
+
+    ++_stats.reads;
 
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit, to_gc_clock(now), tracing::make_trace_info(state.get_trace_state()), query::max_partitions, options.get_timestamp(state));
+        make_partition_slice(options), limit, now, tracing::make_trace_info(state.get_trace_state()), query::max_partitions, options.get_timestamp(state));
 
     int32_t page_size = options.get_page_size();
 
@@ -245,10 +260,10 @@ select_statement::execute(distributed<service::storage_proxy>& proxy,
     if (!aggregate && (page_size <= 0
             || !service::pager::query_pagers::may_need_paging(page_size,
                     *command, key_ranges))) {
-        return execute(proxy, command, std::move(key_ranges), state, options,
-                now);
+        return execute(proxy, command, std::move(key_ranges), state, options, now);
     }
 
+    command->slice.options.set<query::partition_slice::option::allow_short_read>();
     auto p = service::pager::query_pagers::pager(_schema, _selection,
             state, options, command, std::move(key_ranges));
 
@@ -290,20 +305,21 @@ select_statement::execute(distributed<service::storage_proxy>& proxy,
 future<shared_ptr<transport::messages::result_message>>
 select_statement::execute(distributed<service::storage_proxy>& proxy,
                           lw_shared_ptr<query::read_command> cmd,
-                          std::vector<query::partition_range>&& partition_ranges,
+                          dht::partition_range_vector&& partition_ranges,
                           service::query_state& state,
                           const query_options& options,
-                          db_clock::time_point now)
+                          gc_clock::time_point now)
 {
     // If this is a query with IN on partition key, ORDER BY clause and LIMIT
     // is specified we need to get "limit" rows from each partition since there
     // is no way to tell which of these rows belong to the query result before
     // doing post-query ordering.
     if (needs_post_query_ordering() && _limit) {
-        return do_with(std::forward<std::vector<query::partition_range>>(partition_ranges), [this, &proxy, &state, &options, cmd](auto prs) {
-            query::result_merger merger;
+        return do_with(std::forward<dht::partition_range_vector>(partition_ranges), [this, &proxy, &state, &options, cmd](auto prs) {
+            assert(cmd->partition_limit == query::max_partitions);
+            query::result_merger merger(cmd->row_limit * prs.size(), query::max_partitions);
             return map_reduce(prs.begin(), prs.end(), [this, &proxy, &state, &options, cmd] (auto pr) {
-                std::vector<query::partition_range> prange { pr };
+                dht::partition_range_vector prange { pr };
                 auto command = ::make_lw_shared<query::read_command>(*cmd);
                 return proxy.local().query(_schema, command, std::move(prange), options.get_consistency(), state.get_trace_state());
             }, std::move(merger));
@@ -324,18 +340,21 @@ select_statement::execute_internal(distributed<service::storage_proxy>& proxy,
                                    const query_options& options)
 {
     int32_t limit = get_limit(options);
-    auto now = db_clock::now();
+    auto now = gc_clock::now();
     auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(),
-        make_partition_slice(options), limit, to_gc_clock(now), std::experimental::nullopt, query::max_partitions, options.get_timestamp(state));
+        make_partition_slice(options), limit, now, std::experimental::nullopt, query::max_partitions, options.get_timestamp(state));
     auto partition_ranges = _restrictions->get_partition_key_ranges(options);
 
     tracing::add_table_name(state.get_trace_state(), keyspace(), column_family());
 
+    ++_stats.reads;
+
     if (needs_post_query_ordering() && _limit) {
         return do_with(std::move(partition_ranges), [this, &proxy, &state, command] (auto prs) {
-            query::result_merger merger;
+            assert(command->partition_limit == query::max_partitions);
+            query::result_merger merger(command->row_limit * prs.size(), query::max_partitions);
             return map_reduce(prs.begin(), prs.end(), [this, &proxy, &state, command] (auto pr) {
-                std::vector<query::partition_range> prange { pr };
+                dht::partition_range_vector prange { pr };
                 auto cmd = ::make_lw_shared<query::read_command>(*command);
                 return proxy.local().query(_schema, cmd, std::move(prange), db::consistency_level::ONE, state.get_trace_state());
             }, std::move(merger));
@@ -353,7 +372,7 @@ shared_ptr<transport::messages::result_message>
 select_statement::process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
                                   lw_shared_ptr<query::read_command> cmd,
                                   const query_options& options,
-                                  db_clock::time_point now)
+                                  gc_clock::time_point now)
 {
     cql3::selection::result_set_builder builder(*_selection, now,
             options.get_cql_serialization_format());
@@ -367,9 +386,13 @@ select_statement::process_results(foreign_ptr<lw_shared_ptr<query::result>> resu
         if (_is_reversed) {
             rs->reverse();
         }
+        rs->trim(cmd->row_limit);
     }
-    rs->trim(cmd->row_limit);
     return ::make_shared<transport::messages::result_message::rows>(std::move(rs));
+}
+
+::shared_ptr<restrictions::statement_restrictions> select_statement::get_restrictions() const {
+    return _restrictions;
 }
 
 namespace raw {
@@ -386,7 +409,7 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
     , _limit(std::move(limit))
 { }
 
-::shared_ptr<prepared_statement> select_statement::prepare(database& db) {
+::shared_ptr<prepared_statement> select_statement::prepare(database& db, cql_stats& stats, bool for_view) {
     schema_ptr schema = validation::validate_column_family(db, keyspace(), column_family());
     auto bound_names = get_bound_variables();
 
@@ -394,7 +417,7 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
                      ? selection::selection::wildcard(schema)
                      : selection::selection::from_selectors(db, schema, _select_clause);
 
-    auto restrictions = prepare_restrictions(db, schema, bound_names, selection);
+    auto restrictions = prepare_restrictions(db, schema, bound_names, selection, for_view);
 
     if (_parameters->is_distinct()) {
         validate_distinct_selection(schema, selection, restrictions);
@@ -404,6 +427,7 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
     bool is_reversed_ = false;
 
     if (!_parameters->orderings().empty()) {
+        assert(!for_view);
         verify_ordering_is_allowed(restrictions);
         ordering_comparator = get_ordering_comparator(schema, selection, restrictions);
         is_reversed_ = is_reversed(schema);
@@ -418,7 +442,8 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
         std::move(restrictions),
         is_reversed_,
         std::move(ordering_comparator),
-        prepare_limit(db, bound_names));
+        prepare_limit(db, bound_names),
+        stats);
 
     return ::make_shared<prepared>(std::move(stmt), std::move(*bound_names));
 }
@@ -427,11 +452,12 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
 select_statement::prepare_restrictions(database& db,
                                        schema_ptr schema,
                                        ::shared_ptr<variable_specifications> bound_names,
-                                       ::shared_ptr<selection::selection> selection)
+                                       ::shared_ptr<selection::selection> selection,
+                                       bool for_view)
 {
     try {
         return ::make_shared<restrictions::statement_restrictions>(db, schema, std::move(_where_clause), bound_names,
-            selection->contains_only_static_columns(), selection->contains_a_collection());
+            selection->contains_only_static_columns(), selection->contains_a_collection(), for_view);
     } catch (const exceptions::unrecognized_entity_exception& e) {
         if (contains_alias(e.entity)) {
             throw exceptions::invalid_request_exception(sprint("Aliases aren't allowed in the where clause ('%s')", e.relation->to_string()));
@@ -619,6 +645,25 @@ bool select_statement::contains_alias(::shared_ptr<column_identifier> name) {
         int32_type);
 }
 
+}
+
+}
+
+namespace util {
+
+shared_ptr<cql3::statements::raw::select_statement> build_select_statement(
+            const sstring_view& cf_name,
+            const sstring_view& where_clause,
+            std::vector<sstring_view> included_columns) {
+    std::ostringstream out;
+    out << "SELECT ";
+    if (included_columns.empty()) {
+        out << "*";
+    } else {
+        out << join(", ", included_columns);
+    }
+    out << " FROM " << cf_name << " WHERE " << where_clause << " ALLOW FILTERING";
+    return do_with_parser(out.str(), std::mem_fn(&cql3_parser::CqlParser::selectStatement));
 }
 
 }

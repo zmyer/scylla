@@ -83,6 +83,8 @@ private:
      */
     ::shared_ptr<single_column_restrictions> _nonprimary_key_restrictions;
 
+    std::unordered_set<const column_definition*> _not_null_columns;
+
     /**
      * The restrictions used to build the index expressions
      */
@@ -112,7 +114,8 @@ public:
         const std::vector<::shared_ptr<relation>>& where_clause,
         ::shared_ptr<variable_specifications> bound_names,
         bool selects_only_static_columns,
-        bool select_a_collection);
+        bool select_a_collection,
+        bool for_view = false);
 private:
     void add_restriction(::shared_ptr<restriction> restriction);
     void add_single_column_restriction(::shared_ptr<single_column_restriction> restriction);
@@ -171,6 +174,20 @@ private:
      */
     void process_clustering_columns_restrictions(bool has_queriable_index, bool select_a_collection);
 
+    /**
+     * Returns the <code>Restrictions</code> for the specified type of columns.
+     *
+     * @param kind the column type
+     * @return the <code>restrictions</code> for the specified type of columns
+     */
+    ::shared_ptr<restrictions> get_restrictions(column_kind kind) const {
+        switch (kind) {
+        case column_kind::partition_key: return _partition_key_restrictions;
+        case column_kind::clustering_key: return _clustering_columns_restrictions;
+        default: return _nonprimary_key_restrictions;
+        }
+    }
+
 #if 0
     std::vector<::shared_ptr<index_expression>> get_index_expressions(const query_options& options) {
         if (!_uses_secondary_indexing || _index_restrictions.empty()) {
@@ -208,7 +225,7 @@ public:
      * @return the specified bound of the partition key
      * @throws InvalidRequestException if the boundary cannot be retrieved
      */
-    std::vector<query::partition_range> get_partition_key_ranges(const query_options& options) const;
+    dht::partition_range_vector get_partition_key_ranges(const query_options& options) const;
 
 #if 0
     /**
@@ -346,8 +363,20 @@ public:
      * @return <code>true</code> if the query has some restrictions on the clustering columns,
      * <code>false</code> otherwise.
      */
-    bool has_clustering_columns_restriction() {
+    bool has_clustering_columns_restriction() const {
         return !_clustering_columns_restrictions->empty();
+    }
+
+    /**
+     * @return true if column is restricted by some restriction, false otherwise
+     */
+    bool is_restricted(const column_definition* cdef) const {
+        if (_not_null_columns.find(cdef) != _not_null_columns.end()) {
+            return true;
+        }
+
+        auto&& restricted = get_restrictions(cdef->kind).get()->get_column_defs();
+        return std::find(restricted.begin(), restricted.end(), cdef) != restricted.end();
     }
 };
 

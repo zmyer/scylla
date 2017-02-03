@@ -256,7 +256,7 @@ public:
             "Log a warning when compacting partitions larger than this value"   \
     )                                               \
     /* Common memtable settings */  \
-    val(memtable_total_space_in_mb, uint32_t, 0, Used,     \
+    val(memtable_total_space_in_mb, uint32_t, 0, Invalid,     \
             "Specifies the total memory used for all memtables on a node. This replaces the per-table storage settings memtable_operations_in_millions and memtable_throughput_in_mb."  \
     )                                                   \
     /* Common disk settings */  \
@@ -334,7 +334,7 @@ public:
             "\toffheap_buffers  Off heap (direct) NIO buffers.\n"   \
             "\toffheap_objects  Native memory, eliminating NIO buffer heap overhead."   \
     )                                                   \
-    val(memtable_cleanup_threshold, double, .11, Used, \
+    val(memtable_cleanup_threshold, double, .11, Invalid, \
             "Ratio of occupied non-flushing memtable size to total permitted size for triggering a flush of the largest memtable. Larger values mean larger flushes and less compaction, but also less concurrent flush activity, which can make it difficult to keep your disks saturated under heavy write load." \
     )   \
     val(file_cache_size_in_mb, uint32_t, 512, Unused,  \
@@ -736,7 +736,9 @@ public:
     val(lsa_reclamation_step, size_t, 1, Used, "Minimum number of segments to reclaim in a single step") \
     val(prometheus_port, uint16_t, 9180, Used, "Prometheus port, set to zero to disable") \
     val(prometheus_address, sstring, "0.0.0.0", Used, "Prometheus listening address") \
+    val(prometheus_prefix, sstring, "scylla", Used, "Set the prefix of the exported Prometheus metrics. Changing this will break Scylla's dashboard compatibility, do not change unless you know what you are doing.") \
     val(abort_on_lsa_bad_alloc, bool, false, Used, "Abort when allocation in LSA region fails") \
+    val(murmur3_partitioner_ignore_msb_bits, unsigned, 0, Used, "Number of most siginificant token bits to ignore in murmur3 partitioner; increase for very large clusters") \
     /* done! */
 
 #define _make_value_member(name, type, deflt, status, desc, ...)    \

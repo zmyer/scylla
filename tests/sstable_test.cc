@@ -19,7 +19,6 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/test/unit_test.hpp>
 
@@ -194,6 +193,10 @@ SEASTAR_TEST_CASE(missing_summary_query_fail) {
 
 SEASTAR_TEST_CASE(missing_summary_query_negative_fail) {
     return summary_query_fail<-2, 0, 5>(uncompressed_schema(), "tests/sstables/uncompressed", 2);
+}
+
+SEASTAR_TEST_CASE(missing_summary_interval_1_query_ok) {
+    return summary_query<1, 19, 6>(uncompressed_schema(1), "tests/sstables/uncompressed", 2);
 }
 
 SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
@@ -405,6 +408,11 @@ public:
         return proceed::yes;
     }
 
+    virtual proceed consume_counter_cell(bytes_view col_name, bytes_view value, int64_t timestamp) override {
+        BOOST_FAIL("counter cell wasn't expected");
+        abort(); // BOOST_FAIL is not marked as [[noreturn]].
+    }
+
     virtual proceed consume_deleted_cell(bytes_view col_name, sstables::deletion_time deltime) override {
         count_deleted_cell++;
         return proceed::yes;
@@ -423,6 +431,7 @@ public:
     virtual const io_priority_class& io_priority() override {
         return default_priority_class();
     }
+    virtual void reset() override { }
 };
 
 SEASTAR_TEST_CASE(uncompressed_row_read_at_once) {
@@ -509,6 +518,10 @@ public:
         count_cell++;
         return proceed::yes;
     }
+    virtual proceed consume_counter_cell(bytes_view col_name, bytes_view value, int64_t timestamp) override {
+        count_cell++;
+        return proceed::yes;
+    }
     virtual proceed consume_deleted_cell(bytes_view col_name, sstables::deletion_time deltime) override {
         count_deleted_cell++;
         return proceed::yes;
@@ -526,6 +539,7 @@ public:
     virtual const io_priority_class& io_priority() override {
         return default_priority_class();
     }
+    virtual void reset() override { }
 };
 
 
@@ -1208,7 +1222,7 @@ SEASTAR_TEST_CASE(promoted_index_write) {
         for (char i = 'a'; i <= 'z'; i++) {
             for (char j = 'A'; j <= 'Z'; j++) {
                 for (int k = 0; k < 20; k++) {
-                    auto& row = m.partition().clustered_row(
+                    auto& row = m.partition().clustered_row(*s,
                             clustering_key::from_exploded(
                                     *s, {to_bytes(sprint("%d%c%c", k, i, j))}));
                     row.cells().apply(*col,

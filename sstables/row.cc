@@ -39,6 +39,8 @@ private:
         ATOM_NAME_BYTES,
         ATOM_MASK,
         ATOM_MASK_2,
+        COUNTER_CELL,
+        COUNTER_CELL_2,
         EXPIRING_CELL,
         EXPIRING_CELL_2,
         EXPIRING_CELL_3,
@@ -61,6 +63,7 @@ private:
 
     // state for reading a cell
     bool _deleted;
+    bool _counter;
     uint32_t _ttl, _expiration;
 
     bool _read_partial_row = false;
@@ -72,6 +75,7 @@ public:
                 || (_state == state::ATOM_START_2)
                 || (_state == state::ATOM_MASK_2)
                 || (_state == state::STOP_THEN_ATOM_START)
+                || (_state == state::COUNTER_CELL_2)
                 || (_state == state::EXPIRING_CELL_3)) && (_prestate == prestate::NONE));
     }
 
@@ -187,10 +191,12 @@ public:
             if (mask & RANGE_TOMBSTONE_MASK) {
                 _state = state::RANGE_TOMBSTONE;
             } else if (mask & COUNTER_MASK) {
-                // FIXME: see ColumnSerializer.java:deserializeColumnBody
-                throw malformed_sstable_exception("FIXME COUNTER_MASK");
+                _deleted = false;
+                _counter = true;
+                _state = state::COUNTER_CELL;
             } else if (mask & EXPIRATION_MASK) {
                 _deleted = false;
+                _counter = false;
                 _state = state::EXPIRING_CELL;
             } else {
                 // FIXME: see ColumnSerializer.java:deserializeColumnBody
@@ -199,10 +205,21 @@ public:
                 }
                 _ttl = _expiration = 0;
                 _deleted = mask & DELETION_MASK;
+                _counter = false;
                 _state = state::CELL;
             }
             break;
         }
+        case state::COUNTER_CELL:
+            if (read_64(data) != read_status::ready) {
+                _state = state::COUNTER_CELL_2;
+                break;
+            }
+            // fallthrough
+        case state::COUNTER_CELL_2:
+            // _timestamp_of_last_deletion = _u64;
+            _state = state::CELL;
+            goto state_CELL;
         case state::EXPIRING_CELL:
             if (read_32(data) != read_status::ready) {
                 _state = state::EXPIRING_CELL_2;
@@ -219,6 +236,7 @@ public:
         case state::EXPIRING_CELL_3:
             _expiration = _u32;
             _state = state::CELL;
+        state_CELL:
         case state::CELL: {
             if (read_64(data) != read_status::ready) {
                 _state = state::CELL_2;
@@ -245,6 +263,9 @@ public:
                     del.local_deletion_time = consume_be<uint32_t>(_val);
                     del.marked_for_delete_at = _u64;
                     ret = _consumer.consume_deleted_cell(to_bytes_view(_key), del);
+                } else if (_counter) {
+                    ret = _consumer.consume_counter_cell(to_bytes_view(_key),
+                            to_bytes_view(_val), _u64);
                 } else {
                     ret = _consumer.consume_cell(to_bytes_view(_key),
                             to_bytes_view(_val), _u64, _ttl, _expiration);
@@ -272,6 +293,9 @@ public:
                 del.local_deletion_time = consume_be<uint32_t>(_val);
                 del.marked_for_delete_at = _u64;
                 ret = _consumer.consume_deleted_cell(to_bytes_view(_key), del);
+            } else if (_counter) {
+                ret = _consumer.consume_counter_cell(to_bytes_view(_key),
+                        to_bytes_view(_val), _u64);
             } else {
                 ret = _consumer.consume_cell(to_bytes_view(_key),
                         to_bytes_view(_val), _u64, _ttl, _expiration);
@@ -333,9 +357,9 @@ public:
     }
 
     data_consume_rows_context(row_consumer& consumer,
-            input_stream<char> && input, uint64_t maxlen,
+            input_stream<char> && input, uint64_t start, uint64_t maxlen,
             std::experimental::optional<sstable::disk_read_range::row_info> ri = {})
-                : continuous_data_consumer(std::move(input), maxlen)
+                : continuous_data_consumer(std::move(input), start, maxlen)
                 , _consumer(consumer) {
         // If the "ri" option is given, we are reading a partition from the
         // middle (in the beginning of an atom), as would happen when we use
@@ -373,6 +397,11 @@ public:
             throw malformed_sstable_exception("end of input, but not end of row");
         }
     }
+
+    void reset(uint64_t offset) {
+        _state = state::ROW_START;
+        _consumer.reset();
+    }
 };
 
 // data_consume_rows() and data_consume_rows_at_once() both can read just a
@@ -385,10 +414,10 @@ private:
     shared_sstable _sst;
     std::unique_ptr<data_consume_rows_context> _ctx;
 public:
-    impl(shared_sstable sst, row_consumer& consumer, input_stream<char>&& input, uint64_t maxlen,
-             std::experimental::optional<sstable::disk_read_range::row_info> ri)
+    impl(shared_sstable sst, row_consumer& consumer, input_stream<char>&& input, uint64_t start,
+             uint64_t maxlen, std::experimental::optional<sstable::disk_read_range::row_info> ri)
         : _sst(std::move(sst))
-        , _ctx(new data_consume_rows_context(consumer, std::move(input), maxlen, ri))
+        , _ctx(new data_consume_rows_context(consumer, std::move(input), start, maxlen, ri))
     { }
     ~impl() {
         if (_ctx) {
@@ -398,6 +427,9 @@ public:
     }
     future<> read() {
         return _ctx->consume_input(*_ctx);
+    }
+    future<> fast_forward_to(uint64_t begin, uint64_t end) {
+        return _ctx->fast_forward_to(begin, end);
     }
 };
 
@@ -413,18 +445,24 @@ data_consume_context::data_consume_context(std::unique_ptr<impl> p) : _pimpl(std
 future<> data_consume_context::read() {
     return _pimpl->read();
 }
+future<> data_consume_context::fast_forward_to(uint64_t begin, uint64_t end) {
+    return _pimpl->fast_forward_to(begin, end);
+}
 
 data_consume_context sstable::data_consume_rows(
         row_consumer& consumer, sstable::disk_read_range toread) {
-    // TODO: The second "end - start" below is redundant: The first one tells
-    // data_stream() to stop at the "end" byte, which allows optimal read-
-    // ahead and avoiding over-read at the end. The second one tells the
-    // consumer to stop at exactly the same place, and forces the consumer
-    // to maintain its own byte count.
+    return std::make_unique<data_consume_context::impl>(shared_from_this(),
+            consumer, data_stream(toread.start, data_size() - toread.start,
+                consumer.io_priority(), _partition_range_history), toread.start, toread.end - toread.start, toread.ri);
+}
+
+data_consume_context sstable::data_consume_single_partition(
+        row_consumer& consumer, sstable::disk_read_range toread) {
     return std::make_unique<data_consume_context::impl>(shared_from_this(),
             consumer, data_stream(toread.start, toread.end - toread.start,
-                consumer.io_priority()), toread.end - toread.start, toread.ri);
+                 consumer.io_priority(), _single_partition_history), toread.start, toread.end - toread.start, toread.ri);
 }
+
 
 data_consume_context sstable::data_consume_rows(row_consumer& consumer) {
     return data_consume_rows(consumer, {0, data_size()});
@@ -434,7 +472,7 @@ future<> sstable::data_consume_rows_at_once(row_consumer& consumer,
         uint64_t start, uint64_t end) {
     return data_read(start, end - start, consumer.io_priority()).then([&consumer]
                                                (temporary_buffer<char> buf) {
-        data_consume_rows_context ctx(consumer, input_stream<char>(), -1);
+        data_consume_rows_context ctx(consumer, input_stream<char>(), 0, -1);
         ctx.process(buf);
         ctx.verify_end_state();
     });

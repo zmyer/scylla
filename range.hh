@@ -21,8 +21,10 @@
 
 #pragma once
 
+#include "stdx.hh"
+#include <list>
 #include <experimental/optional>
-#include <iostream>
+#include <iosfwd>
 #include <boost/range/algorithm/copy.hpp>
 #include <boost/range/adaptor/sliced.hpp>
 #include <boost/range/adaptor/transformed.hpp>
@@ -332,12 +334,22 @@ public:
         wrapping_range right(bound(split_point, false), end());
         return std::make_pair(std::move(left), std::move(right));
     }
-    // Create a sub-range including values greater than the split_point. split_point has to be inside the range
+    // Create a sub-range including values greater than the split_point. Returns stdx::nullopt if
+    // split_point is after the end (but not included in the range, in case of wraparound ranges)
     // Comparator must define a total ordering on T.
     template<typename Comparator>
-    wrapping_range<T> split_after(const T& split_point, Comparator&& cmp) const {
-        assert(contains(split_point, std::forward<Comparator>(cmp)));
-        return wrapping_range(bound(split_point, false), end());
+    stdx::optional<wrapping_range<T>> split_after(const T& split_point, Comparator&& cmp) const {
+        if (contains(split_point, std::forward<Comparator>(cmp))
+                && (!end() || cmp(split_point, end()->value()) != 0)) {
+            return wrapping_range(bound(split_point, false), end());
+        } else if (end() && cmp(split_point, end()->value()) >= 0) {
+            // whether to return stdx::nullopt or the full range is not
+            // well-defined for wraparound ranges; we return nullopt
+            // if split_point is after the end.
+            return stdx::nullopt;
+        } else {
+            return *this;
+        }
     }
     // Transforms this range into a new range of a different value type
     // Supplied transformer should transform value of type T (the old type) into value of type U (the new type).
@@ -425,12 +437,17 @@ public:
     explicit nonwrapping_range(wrapping_range<T>&& r)
         : _range(std::move(r))
     { }
+    // Can only be called if !r.is_wrap_around().
+    explicit nonwrapping_range(const wrapping_range<T>& r)
+        : _range(r)
+    { }
     operator wrapping_range<T>() const & {
         return _range;
     }
     operator wrapping_range<T>() && {
         return std::move(_range);
     }
+
     // the point is before the range.
     // Comparator must define a total ordering on T.
     template<typename Comparator>
@@ -454,6 +471,9 @@ public:
 
         return wrapping_range<T>::greater_than_or_equal(_range.end_bound(), other._range.start_bound(), cmp)
             && wrapping_range<T>::greater_than_or_equal(other._range.end_bound(), _range.start_bound(), cmp);
+    }
+    static nonwrapping_range make(bound start, bound end) {
+        return nonwrapping_range({std::move(start)}, {std::move(end)});
     }
     static nonwrapping_range make_open_ended_both_sides() {
         return {{}, {}};
@@ -512,12 +532,17 @@ public:
         nonwrapping_range right(bound(split_point, false), end());
         return std::make_pair(std::move(left), std::move(right));
     }
-    // Create a sub-range including values greater than the split_point. split_point has to be inside the range
-    // Comparator must define a total ordering on T.
+    // Create a sub-range including values greater than the split_point. If split_point is after
+    // the end, returns stdx::nullopt.
     template<typename Comparator>
-    nonwrapping_range<T> split_after(const T& split_point, Comparator&& cmp) const {
-        assert(contains(split_point, std::forward<Comparator>(cmp)));
-        return nonwrapping_range(bound(split_point, false), end());
+    stdx::optional<nonwrapping_range> split_after(const T& split_point, Comparator&& cmp) const {
+        if (end() && cmp(split_point, end()->value()) >= 0) {
+            return stdx::nullopt;
+        } else if (start() && cmp(split_point, start()->value()) < 0) {
+            return *this;
+        } else {
+            return nonwrapping_range(range_bound<T>(split_point, false), end());
+        }
     }
     // Transforms this range into a new range of a different value type
     // Supplied transformer should transform value of type T (the old type) into value of type U (the new type).
@@ -567,6 +592,63 @@ public:
         deoverlapped_ranges.emplace_back(std::move(current));
         return deoverlapped_ranges;
     }
+
+private:
+    // These private functions optimize the case where a sequence supports the
+    // lower and upper bound operations more efficiently, as is the case with
+    // some boost containers.
+    struct std_ {};
+    struct built_in_ : std_ {};
+
+    template<typename Range, typename LessComparator,
+             typename = decltype(&std::remove_reference<Range>::type::lower_bound)>
+    typename std::remove_reference<Range>::type::const_iterator do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
+        return r.lower_bound(value, std::forward<LessComparator>(cmp));
+    }
+
+    template<typename Range, typename LessComparator,
+             typename = decltype(&std::remove_reference<Range>::type::upper_bound)>
+    typename std::remove_reference<Range>::type::const_iterator do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, built_in_) const {
+        return r.upper_bound(value, std::forward<LessComparator>(cmp));
+    }
+
+    template<typename Range, typename LessComparator>
+    typename std::remove_reference<Range>::type::const_iterator do_lower_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
+        return std::lower_bound(r.begin(), r.end(), value, std::forward<LessComparator>(cmp));
+    }
+
+    template<typename Range, typename LessComparator>
+    typename std::remove_reference<Range>::type::const_iterator do_upper_bound(const T& value, Range&& r, LessComparator&& cmp, std_) const {
+        return std::upper_bound(r.begin(), r.end(), value, std::forward<LessComparator>(cmp));
+    }
+public:
+    // Return the lower bound of the specified sequence according to these bounds.
+    template<typename Range, typename LessComparator>
+    typename std::remove_reference<Range>::type::const_iterator lower_bound(Range&& r, LessComparator&& cmp) const {
+        return start()
+            ? (start()->is_inclusive()
+                ? do_lower_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
+                : do_upper_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_()))
+            : std::cbegin(r);
+    }
+    // Return the upper bound of the specified sequence according to these bounds.
+    template<typename Range, typename LessComparator>
+    typename std::remove_reference<Range>::type::const_iterator upper_bound(Range&& r, LessComparator&& cmp) const {
+        return end()
+             ? (end()->is_inclusive()
+                ? do_upper_bound(end()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
+                : do_lower_bound(end()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_()))
+             : (is_singular()
+                ? do_upper_bound(start()->value(), std::forward<Range>(r), std::forward<LessComparator>(cmp), built_in_())
+                : std::cend(r));
+    }
+    // Returns a subset of the range that is within these bounds.
+    template<typename Range, typename LessComparator>
+    boost::iterator_range<typename std::remove_reference<Range>::type::const_iterator>
+    slice(Range&& range, LessComparator&& cmp) const {
+        return boost::make_iterator_range(lower_bound(range, cmp), upper_bound(range, cmp));
+    }
+
     template<typename U>
     friend std::ostream& operator<<(std::ostream& out, const nonwrapping_range<U>& r);
 };

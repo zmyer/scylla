@@ -2,6 +2,8 @@
 #
 #  Copyright (C) 2015 ScyllaDB
 
+. /usr/lib/scylla/scylla_lib.sh
+
 print_usage() {
     echo "scylla-raid-setup --disks /dev/hda,/dev/hdb... --raiddev /dev/md0 --update-fstab"
     echo "  --disks	specify disks for RAID"
@@ -54,14 +56,12 @@ if [ "`mount|grep /var/lib/scylla`" != "" ]; then
     exit 1
 fi
 
-. /etc/os-release
-if [ "$NAME" = "Ubuntu" ]; then
+if is_debian_variant; then
     env DEBIAN_FRONTEND=noninteractive apt-get -y install mdadm xfsprogs
 else
     yum -y install mdadm xfsprogs
 fi
-mdadm --create --verbose --force --run $RAID --level=0 -c256 --raid-devices=$NR_DISK $DISKS
-blockdev --setra 65536 $RAID
+mdadm --create --verbose --force --run $RAID --level=0 -c1024 --raid-devices=$NR_DISK $DISKS
 mkfs.xfs $RAID -f
 echo "DEVICE $DISKS" > /etc/mdadm.conf
 mdadm --detail --scan >> /etc/mdadm.conf

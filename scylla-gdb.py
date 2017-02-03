@@ -1,4 +1,6 @@
-import gdb, gdb.printing, uuid
+import gdb, gdb.printing, uuid, argparse
+from operator import attrgetter
+from collections import defaultdict
 
 def template_arguments(gdb_type):
     n = 0
@@ -235,6 +237,194 @@ class scylla_memory(gdb.Command):
                 front = int(span['link']['_next'])
             gdb.write('{index:5} {size:13} {total}\n'.format(index=index, size=(1<<index)*page_size, total=total*page_size))
 
+
+
+class TreeNode(object):
+    def __init__(self, key):
+        self.key = key
+        self.children_by_key = {}
+
+    def get_or_add(self, key):
+        node = self.children_by_key.get(key, None)
+        if not node:
+            node = self.__class__(key)
+            self.add(node)
+        return node
+
+    def add(self, node):
+        self.children_by_key[node.key] = node
+
+    def squash_child(self):
+        assert self.has_only_one_child()
+        self.children_by_key = next(iter(self.children)).children_by_key
+
+    @property
+    def children(self):
+        return self.children_by_key.values()
+
+    def has_only_one_child(self):
+        return len(self.children_by_key) == 1
+
+    def has_children(self):
+        return bool(self.children_by_key)
+
+    def remove_all(self):
+        self.children_by_key.clear()
+
+class ProfNode(TreeNode):
+    def __init__(self, key):
+        super(ProfNode, self).__init__(key)
+        self.size = 0
+        self.count = 0
+        self.tail = []
+
+    @property
+    def attributes(self):
+        return {
+            'size': self.size,
+            'count': self.count
+        }
+
+def collapse_similar(node):
+    while node.has_only_one_child():
+        child = next(iter(node.children))
+        if node.attributes == child.attributes:
+            node.squash_child()
+            node.tail.append(child.key)
+        else:
+            break
+
+    for child in node.children:
+        collapse_similar(child)
+
+def strip_level(node, level):
+    if level <= 0:
+        node.remove_all()
+    else:
+        for child in node.children:
+            strip_level(child, level - 1)
+
+def print_tree(root_node,
+        formatter=attrgetter('key'),
+        order_by=attrgetter('key'),
+        printer=sys.stdout.write,
+        node_filter=None):
+
+    def print_node(node, is_last_history):
+        stems = (" |   ", "     ")
+        branches = (" |-- ", " \-- ")
+
+        label_lines = formatter(node).rstrip('\n').split('\n')
+        prefix_without_branch = ''.join(map(stems.__getitem__, is_last_history[:-1]))
+
+        if is_last_history:
+            printer(prefix_without_branch)
+            printer(branches[is_last_history[-1]])
+        printer("%s\n" % label_lines[0])
+
+        for line in label_lines[1:]:
+            printer(''.join(map(stems.__getitem__, is_last_history)))
+            printer("%s\n" % line)
+
+        children = sorted(filter(node_filter, node.children), key=order_by)
+        if children:
+            for child in children[:-1]:
+                print_node(child, is_last_history + [False])
+            print_node(children[-1], is_last_history + [True])
+
+        is_last = not is_last_history or is_last_history[-1]
+        if not is_last:
+           printer("%s%s\n" % (prefix_without_branch, stems[False]))
+
+    if not node_filter or node_filter(root_node):
+        print_node(root_node, [])
+
+
+class scylla_heapprof(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla heapprof', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
+
+    def invoke(self, arg, from_tty):
+        parser = argparse.ArgumentParser(description="scylla heapprof")
+        parser.add_argument("-G", "--inverted", action="store_true",
+            help="Compute caller-first profile instead of callee-first")
+        parser.add_argument("-a", "--addresses", action="store_true",
+            help="Show raw addresses before resolved symbol names")
+        parser.add_argument("--no-symbols", action="store_true",
+            help="Show only raw addresses")
+        parser.add_argument("--flame", action="store_true",
+            help="Write flamegraph data to heapprof.stacks instead of showing the profile")
+        parser.add_argument("--min", action="store", type=int, default=0,
+            help="Drop branches allocating less than given amount")
+        try:
+            args = parser.parse_args(arg.split())
+        except SystemExit:
+            return
+
+        root = ProfNode(None)
+        cpu_mem = gdb.parse_and_eval('\'memory::cpu_mem\'')
+        site = cpu_mem['alloc_site_list_head']
+
+        while site:
+            size = int(site['size'])
+            count = int(site['count'])
+            if size:
+                n = root
+                n.size += size
+                n.count += count
+                addresses = list(map(int, std_vector(site['backtrace'])))
+                addresses.pop(0) # drop memory::get_backtrace()
+                if args.inverted:
+                    seq = reversed(addresses)
+                else:
+                    seq = addresses
+                for addr in seq:
+                    n = n.get_or_add(addr)
+                    n.size += size
+                    n.count += count
+            site = site['next']
+
+        def resolver(addr):
+            if args.no_symbols:
+                return '0x%x' % addr
+            if args.addresses:
+                return '0x%x %s' % (addr, resolve(addr) or '')
+            return resolve(addr) or ('0x%x' % addr)
+
+        if args.flame:
+            file_name = 'heapprof.stacks'
+            with open(file_name, 'w') as out:
+                trace = list()
+                def print_node(n):
+                    if n.key:
+                        trace.append(n.key)
+                        trace.extend(n.tail)
+                    for c in n.children:
+                        print_node(c)
+                    if not n.has_children():
+                        out.write("%s %d\n" % (';'.join(map(lambda x: '%s (#%d)' % (x, n.count), map(resolver, trace))), n.size))
+                    if n.key:
+                        del trace[-1 - len(n.tail):]
+                print_node(root)
+            gdb.write('Wrote %s\n' % (file_name))
+        else:
+            def node_formatter(n):
+                if n.key is None:
+                    name = "All"
+                else:
+                    name = resolver(n.key)
+                return "%s (%d, #%d)\n%s" % (name, n.size, n.count, '\n'.join(map(resolver, n.tail)))
+
+            def node_filter(n):
+                return n.size >= args.min
+
+            collapse_similar(root)
+            print_tree(root,
+                formatter=node_formatter,
+                order_by=lambda n: -n.size,
+                node_filter=node_filter,
+                printer=gdb.write)
+
 def get_seastar_memory_start_and_size():
     cpu_mem = gdb.parse_and_eval('\'memory::cpu_mem\'')
     page_size = int(gdb.parse_and_eval('\'memory::page_size\''))
@@ -318,9 +508,9 @@ class scylla_ptr(gdb.Command):
             msg += ', large'
 
         # FIXME: handle debug-mode build
-        segment_size = int(gdb.parse_and_eval('\'logalloc\'::segment::size'))
-        index = gdb.parse_and_eval('(%d - \'logalloc\'::shard_segment_pool._segments_base) / \'logalloc\'::segment::size' % (ptr))
-        desc = gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._segments[%d]' % (index))
+        segment_size = int(gdb.parse_and_eval('\'logalloc::segment\'::size'))
+        index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._segments_base) / \'logalloc::segment\'::size' % (ptr))
+        desc = gdb.parse_and_eval('\'logalloc::shard_segment_pool\'._segments._M_impl._M_start[%d]' % (index))
         if desc['_lsa_managed']:
             msg += ', LSA-managed'
 
@@ -678,6 +868,75 @@ class scylla_threads(gdb.Command):
             for t in seastar_threads_on_current_shard():
                 gdb.write('[shard %2d] (seastar::thread_context*) 0x%x\n' % (shard, t.address))
 
+class circular_buffer(object):
+    def __init__(self, ref):
+        self.ref = ref
+    def __iter__(self):
+        impl = self.ref['_impl']
+        st = impl['storage']
+        cap = impl['capacity']
+        i = impl['begin']
+        end = impl['end']
+        while i < end:
+            yield st[i % cap]
+            i += 1
+
+# Prints histogram of task types in reactor's pending task queue.
+#
+# Example:
+# (gdb) scylla task-stats
+#    16243: 0x18904f0 vtable for lambda_task<later()::{lambda()#1}> + 16
+#    16091: 0x197fc60 _ZTV12continuationIZN6futureIJEE12then_wrappedIZNS1_16handle_exception...
+#    16090: 0x19bab50 _ZTV12continuationIZN6futureIJEE12then_wrappedINS1_12finally_bodyIZN7s...
+#    14280: 0x1b36940 _ZTV12continuationIZN6futureIJEE12then_wrappedIZN17smp_message_queue15...
+#
+#    ^      ^         ^
+#    |      |         '-- symbol name for vtable pointer
+#    |      '------------ vtable pointer for the object pointed to by task*
+#    '------------------- task count
+#
+class scylla_task_stats(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla task-stats', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
+    def invoke(self, arg, for_tty):
+        vptr_count = defaultdict(int)
+        vptr_type = gdb.lookup_type('uintptr_t').pointer()
+        for t in circular_buffer(gdb.parse_and_eval('local_engine._pending_tasks')):
+            vptr = int(t['_M_t']['_M_head_impl'].reinterpret_cast(vptr_type).dereference())
+            vptr_count[vptr] += 1
+        for vptr, count in sorted(vptr_count.items(), key=lambda e: -e[1]):
+            gdb.write('%10d: 0x%x %s\n' % (count, vptr, resolve(vptr)))
+
+
+# Prints contents of reactor pending tasks queue.
+#
+# Example:
+# (gdb) scylla tasks
+# (task*) 0x60017d8c7f88  _ZTV12continuationIZN6futureIJEE12then_wrappedIZN17smp_message_queu...
+# (task*) 0x60019a391730  _ZTV12continuationIZN6futureIJEE12then_wrappedIZNS1_16handle_except...
+# (task*) 0x60018fac2208  vtable for lambda_task<later()::{lambda()#1}> + 16
+# (task*) 0x60016e8b7428  _ZTV12continuationIZN6futureIJEE12then_wrappedINS1_12finally_bodyIZ...
+# (task*) 0x60017e5bece8  _ZTV12continuationIZN6futureIJEE12then_wrappedINS1_12finally_bodyIZ...
+# (task*) 0x60017e7f8aa0  _ZTV12continuationIZN6futureIJEE12then_wrappedIZNS1_16handle_except...
+# (task*) 0x60018fac21e0  vtable for lambda_task<later()::{lambda()#1}> + 16
+# (task*) 0x60016e8b7540  _ZTV12continuationIZN6futureIJEE12then_wrappedINS1_12finally_bodyIZ...
+# (task*) 0x600174c34d58  _ZTV12continuationIZN6futureIJEE12then_wrappedINS1_12finally_bodyIZ...
+#
+#         ^               ^
+#         |               |
+#         |               '------------ symbol name for task's vtable pointer
+#         '---------------------------- task pointer
+#
+class scylla_tasks(gdb.Command):
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla tasks', gdb.COMMAND_USER, gdb.COMPLETE_NONE, True)
+    def invoke(self, arg, for_tty):
+        vptr_type = gdb.lookup_type('uintptr_t').pointer()
+        for t in circular_buffer(gdb.parse_and_eval('local_engine._pending_tasks')):
+            ptr = t['_M_t']['_M_head_impl']
+            vptr = int(ptr.reinterpret_cast(vptr_type).dereference())
+            gdb.write('(task*) 0x%x  %s\n' % (ptr, resolve(vptr)))
+
 scylla()
 scylla_databases()
 scylla_keyspaces()
@@ -686,6 +945,7 @@ scylla_memory()
 scylla_ptr()
 scylla_mem_ranges()
 scylla_mem_range()
+scylla_heapprof()
 scylla_lsa()
 scylla_lsa_zones()
 scylla_lsa_segment()
@@ -696,3 +956,5 @@ scylla_shard()
 scylla_thread()
 scylla_unthread()
 scylla_threads()
+scylla_task_stats()
+scylla_tasks()

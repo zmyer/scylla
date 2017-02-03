@@ -131,7 +131,7 @@ public:
 
     virtual future<::shared_ptr<transport::messages::result_message>> execute_prepared(
         bytes id,
-        std::vector<bytes_opt> values) override
+        std::vector<cql3::raw_value> values) override
     {
         auto prepared = local_qp().get_prepared(id);
         if (!prepared) {
@@ -194,7 +194,7 @@ public:
           return cf.find_partition_slow(schema, pkey)
                   .then([schema, ckey, column_name, exp] (column_family::const_mutation_partition_ptr p) {
             assert(p != nullptr);
-            auto row = p->find_row(ckey);
+            auto row = p->find_row(*schema, ckey);
             assert(row != nullptr);
             auto col_def = schema->get_column_definition(utf8_type->decompose(column_name));
             assert(col_def != nullptr);
@@ -309,9 +309,7 @@ public:
             bm.start(std::ref(qp)).get();
             auto stop_bm = defer([&bm] { bm.stop().get(); });
 
-            db->invoke_on_all([] (database& db) {
-                return db.init_system_keyspace();
-            }).get();
+            distributed_loader::init_system_keyspace(*db).get();
 
             auto& ks = db->local().find_keyspace(db::system_keyspace::NAME);
             parallel_for_each(ks.metadata()->cf_meta_data(), [&ks] (auto& pair) {
@@ -329,7 +327,7 @@ public:
 
             service::get_local_storage_service().init_server().get();
             auto deinit_storage_service_server = defer([] {
-                gms::get_local_gossiper().stop_gossiping().get();
+                gms::stop_gossiping().get();
                 auth::auth::shutdown().get();
             });
 
@@ -353,4 +351,16 @@ future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func, const db::
 
 future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func) {
     return do_with_cql_env(std::move(func), db::config{});
+}
+
+future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, const db::config& cfg_in) {
+    return single_node_cql_env::do_with([func = std::move(func)] (auto& e) {
+        return seastar::async([func = std::move(func), &e] {
+            return func(e);
+        });
+    }, cfg_in);
+}
+
+future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func) {
+    return do_with_cql_env_thread(std::move(func), db::config{});
 }

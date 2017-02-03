@@ -22,6 +22,7 @@
 #include "canonical_mutation.hh"
 #include "mutation.hh"
 #include "mutation_partition_serializer.hh"
+#include "counters.hh"
 #include "converting_mutation_partition_applier.hh"
 #include "hashing_partition_visitor.hh"
 #include "utils/UUID.hh"
@@ -44,7 +45,7 @@ canonical_mutation::canonical_mutation(const mutation& m)
     mutation_partition_serializer part_ser(*m.schema(), m.partition());
 
     bytes_ostream out;
-    ser::writer_of_canonical_mutation wr(out);
+    ser::writer_of_canonical_mutation<bytes_ostream> wr(out);
     std::move(wr).write_table_id(m.schema()->id())
                  .write_schema_version(m.schema()->version())
                  .write_key(m.key())
